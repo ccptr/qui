@@ -1,0 +1,14 @@
+[package]
+name = "vkui"
+description = "A minimal immediate-mode GUI toolkit on Vulkan (ash) and winit, with its own TrueType rasterizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `loaded`: libvulkan is opened at runtime, so the binary starts (and can
+# report the problem) on machines without Vulkan.
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+# No client-side-decoration feature: it would pull in a second font
+# rasterizer and a 2D renderer just for the title bar on GNOME.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }

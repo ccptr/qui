@@ -79,10 +79,9 @@ pub trait App: 'static {
 
     /// The clipboard offered both an image and text (and no files), e.g. a
     /// copied image with its address, or rich text along with a picture of
-    /// it: the app picks one, e.g. by asking. Default: the image.
-    fn pasted_either(&mut self, image: Vec<u8>, extension: &'static str, _text: String) {
-        self.pasted_image(image, extension);
-    }
+    /// it. Which one the user meant can't be told from the clipboard, so
+    /// there is no default: the app asks, or decides for its own reasons.
+    fn pasted_either(&mut self, image: Vec<u8>, extension: &'static str, text: String);
 
     /// Copying to or pasting from the clipboard failed.
     fn clipboard_error(&mut self, _error: String) {}

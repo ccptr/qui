@@ -44,7 +44,8 @@ pub struct Cx {
     /// Put this text on the clipboard.
     pub copy: Option<String>,
     /// Paste as if Ctrl+V was pressed outside a text field: copied files
-    /// go to [`App::dropped`], text to [`App::pasted`].
+    /// go to [`App::dropped`], an image to [`App::pasted_image`], text to
+    /// [`App::pasted`].
     pub paste: bool,
 }
 
@@ -67,8 +68,14 @@ pub trait App: 'static {
     /// A file was dropped onto the window, or pasted outside a text field.
     fn dropped(&mut self, _path: PathBuf) {}
 
-    /// Text was pasted outside a text field (and there were no copied files).
+    /// Text was pasted outside a text field (and there were no copied files
+    /// or image).
     fn pasted(&mut self, _text: String) {}
+
+    /// An image was pasted outside a text field (and there were no copied
+    /// files): its encoded bytes, and the file extension of its format
+    /// ("png", "jpg", ...).
+    fn pasted_image(&mut self, _data: Vec<u8>, _extension: &'static str) {}
 
     /// Copying to or pasting from the clipboard failed.
     fn clipboard_error(&mut self, _error: String) {}
@@ -77,14 +84,31 @@ pub trait App: 'static {
 /// What a pending `fetch_data_transfer` is for.
 #[derive(Clone, Copy, Debug)]
 enum Fetch {
-    /// A `text/uri-list`, from a drop or a paste. `text` is the clipboard
-    /// to read as text instead if the list holds no local files (e.g. a
-    /// copied web link).
-    Files { text: Option<DataTransferId> },
+    /// A `text/uri-list`, from a drop or a paste. `fallback` is the
+    /// clipboard to paste an image or text from instead if the list holds
+    /// no local files (e.g. a copied web link).
+    Files { fallback: Option<DataTransferId> },
     /// Text for the focused text field.
     Field,
     /// Text pasted outside a text field, for the app.
     Text,
+    /// An image pasted outside a text field, in this format.
+    Image { extension: &'static str },
+}
+
+/// Image formats taken from the clipboard, most preferred first. Programs
+/// that copy an image usually offer several; PNG is lossless and readable
+/// everywhere.
+const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "webp", "gif", "bmp", "tiff", "svg", "ico"];
+
+/// The most preferred image format the clipboard offers.
+fn image_type(dt: &dyn winit::data_transfer::DataTransfer) -> Option<&'static str> {
+    let types = dt.available_types();
+    IMAGE_EXTENSIONS.into_iter().find(|&ext| {
+        types
+            .iter()
+            .any(|ty| ty.hint() == Some(TypeHint::Image { extension_hint: Some(ext) }))
+    })
 }
 
 struct Runner<A: App> {
@@ -278,26 +302,55 @@ impl<A: App> Runner<A> {
     }
 
     /// Reads the clipboard: text into the focused text field (`field`), or
-    /// else copied files, or text when there are none, for the app.
+    /// else for the app: copied files, or an image or text when there are
+    /// none.
     fn paste(&mut self, event_loop: &dyn ActiveEventLoop, field: bool) {
         let id = match event_loop.clipboard() {
             Ok(Some(id)) => id,
-            Ok(None) => return,
+            Ok(None) if field => return,
+            Ok(None) => return self.clipboard_error("The clipboard is empty.".into(), event_loop),
             Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
         };
-        let (files, text) = event_loop.data_transfer(id).map_or((false, false), |dt| {
-            (dt.has_type(&TypeHint::UriList), dt.has_type(&TypeHint::Plaintext))
+        let (files, image, text) = event_loop.data_transfer(id).map_or((false, None, false), |dt| {
+            (dt.has_type(&TypeHint::UriList), image_type(&*dt), dt.has_type(&TypeHint::Plaintext))
         });
-        let (hint, fetch) = match (field, files, text) {
-            (true, _, true) => (TypeHint::Plaintext, Fetch::Field),
-            (false, true, _) => (TypeHint::UriList, Fetch::Files { text: text.then_some(id) }),
-            (false, false, true) => (TypeHint::Plaintext, Fetch::Text),
-            _ => return,
-        };
         if self.trace {
-            eprintln!("vkui: paste {fetch:?} files={files} text={text}");
+            eprintln!("vkui: paste field={field} files={files} image={image:?} text={text}");
         }
+        let (hint, fetch) = match (field, files, image, text) {
+            (true, _, _, true) => (TypeHint::Plaintext, Fetch::Field),
+            (true, ..) => return,
+            (false, true, ..) => {
+                let fallback = (image.is_some() || text).then_some(id);
+                (TypeHint::UriList, Fetch::Files { fallback })
+            }
+            (false, false, Some(extension), _) => {
+                (TypeHint::Image { extension_hint: Some(extension) }, Fetch::Image { extension })
+            }
+            (false, false, None, true) => (TypeHint::Plaintext, Fetch::Text),
+            (false, false, None, false) => {
+                let error = "The clipboard holds nothing that can be sent (no files, image or text).";
+                return self.clipboard_error(error.into(), event_loop);
+            }
+        };
         if let Err(e) = self.fetch(event_loop, id, hint, fetch) {
+            self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
+        }
+    }
+
+    /// The image or text of a clipboard whose file list held no local files.
+    fn paste_fallback(&mut self, event_loop: &dyn ActiveEventLoop, id: DataTransferId) {
+        let image = event_loop.data_transfer(id).ok().and_then(|dt| image_type(&*dt));
+        let result = match image {
+            Some(extension) => self.fetch(
+                event_loop,
+                id,
+                TypeHint::Image { extension_hint: Some(extension) },
+                Fetch::Image { extension },
+            ),
+            None => self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Text),
+        };
+        if let Err(e) = result {
             self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
         }
     }
@@ -316,15 +369,15 @@ impl<A: App> Runner<A> {
 
     fn received(&mut self, event_loop: &dyn ActiveEventLoop, fetch: Fetch, value: &dyn TypedData) {
         match fetch {
-            Fetch::Files { text } => {
+            Fetch::Files { fallback } => {
                 let uris = value.try_as_uris();
                 if self.trace {
                     eprintln!("vkui: received {uris:?}");
                 }
                 let paths = uris.map(|uris| uri_paths(&uris)).unwrap_or_default();
                 if paths.is_empty() {
-                    if let Some(id) = text {
-                        let _ = self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Text);
+                    if let Some(id) = fallback {
+                        self.paste_fallback(event_loop, id);
                     }
                     return;
                 }
@@ -341,6 +394,17 @@ impl<A: App> Runner<A> {
                     (Fetch::Field, Some(ui)) => ui.paste(&text),
                     _ => self.app.pasted(text),
                 }
+            }
+            Fetch::Image { extension } => {
+                let data = match value.try_as_bytes() {
+                    Ok(data) if !data.is_empty() => data,
+                    Ok(_) => return self.clipboard_error("The copied image is empty.".into(), event_loop),
+                    Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
+                };
+                if self.trace {
+                    eprintln!("vkui: received a {extension} image of {} bytes", data.len());
+                }
+                self.app.pasted_image(data, extension);
             }
         }
         self.rebuild(false, event_loop);
@@ -359,7 +423,7 @@ impl<A: App> Runner<A> {
             let actions: &[DndAction] = if files { &[DndAction::Copy] } else { &[] };
             let _ = event_loop.set_valid_dnd_actions(id, actions);
         } else if files {
-            let _ = self.fetch(event_loop, id, TypeHint::UriList, Fetch::Files { text: None });
+            let _ = self.fetch(event_loop, id, TypeHint::UriList, Fetch::Files { fallback: None });
         }
         if self.trace {
             eprintln!("vkui: drag dropped={dropped} files={files}");

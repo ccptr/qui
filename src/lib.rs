@@ -43,10 +43,58 @@ pub struct Cx {
     pub again: bool,
     /// Put this text on the clipboard.
     pub copy: Option<String>,
-    /// Paste as if Ctrl+V was pressed outside a text field: copied files
-    /// go to [`App::dropped`], an image to [`App::pasted_image`], text to
+    /// Paste as if Ctrl+V was pressed outside a text field: see
     /// [`App::pasted`].
     pub paste: bool,
+}
+
+/// What the clipboard held when pasting outside a text field. Programs
+/// often offer one thing in several forms (a file manager: the files, and
+/// their paths as text); a form that only repeats another is left out, but
+/// different things offered together are all here: which of them the user
+/// meant can't be told from the clipboard.
+#[derive(Debug, Default)]
+pub struct Pasted {
+    /// Copied local files and folders.
+    pub files: Vec<PathBuf>,
+    /// A copied image: its encoded bytes, and the file extension of its
+    /// format ("png", "jpg", ...).
+    pub image: Option<(Vec<u8>, &'static str)>,
+    /// Copied text (never blank).
+    pub text: Option<String>,
+}
+
+impl Pasted {
+    /// How many kinds of content (files, image, text) there are.
+    pub fn kinds(&self) -> usize {
+        usize::from(!self.files.is_empty()) + usize::from(self.image.is_some()) + usize::from(self.text.is_some())
+    }
+
+    /// Leaves out forms that repeat the files: text that only lists them
+    /// (as paths or URIs), and an image that is the one copied file's
+    /// content.
+    fn drop_repeats(&mut self, uris: &[String]) {
+        if self.files.is_empty() {
+            return;
+        }
+        let files = &self.files;
+        let is_file = |line: &str| {
+            uris.iter().any(|uri| uri.trim() == line)
+                || files.iter().any(|path| path.as_os_str() == line)
+                || uri_path(line).is_some_and(|path| files.contains(&path))
+        };
+        if self.text.as_deref().is_some_and(|text| {
+            text.lines().map(str::trim).filter(|line| !line.is_empty()).all(is_file)
+        }) {
+            self.text = None;
+        }
+        if let (Some((data, _)), [file]) = (&self.image, files.as_slice())
+            && std::fs::metadata(file).is_ok_and(|meta| meta.len() == data.len() as u64)
+            && std::fs::read(file).is_ok_and(|content| content == *data)
+        {
+            self.image = None;
+        }
+    }
 }
 
 pub trait App: 'static {
@@ -65,23 +113,13 @@ pub trait App: 'static {
     /// Wake-ups are coalesced: several `wake_up` calls may arrive as one.
     fn woken(&mut self) -> bool;
 
-    /// A file was dropped onto the window, or pasted outside a text field.
+    /// A file was dropped onto the window.
     fn dropped(&mut self, _path: PathBuf) {}
 
-    /// Text was pasted outside a text field (and there were no copied files
-    /// or image).
-    fn pasted(&mut self, _text: String) {}
-
-    /// An image was pasted outside a text field (and there were no copied
-    /// files): its encoded bytes, and the file extension of its format
-    /// ("png", "jpg", ...).
-    fn pasted_image(&mut self, _data: Vec<u8>, _extension: &'static str) {}
-
-    /// The clipboard offered both an image and text (and no files), e.g. a
-    /// copied image with its address, or rich text along with a picture of
-    /// it. Which one the user meant can't be told from the clipboard, so
-    /// there is no default: the app asks, or decides for its own reasons.
-    fn pasted_either(&mut self, image: Vec<u8>, extension: &'static str, text: String);
+    /// Ctrl+V (or [`Cx::paste`]) outside a text field: everything the
+    /// clipboard held, possibly nothing. With several kinds of content, the
+    /// app asks which to take.
+    fn pasted(&mut self, _content: Pasted) {}
 
     /// Copying to or pasting from the clipboard failed.
     fn clipboard_error(&mut self, _error: String) {}
@@ -90,37 +128,34 @@ pub trait App: 'static {
 /// What a pending `fetch_data_transfer` is for.
 #[derive(Clone, Copy, Debug)]
 enum Fetch {
-    /// A `text/uri-list`, from a drop or a paste. `fallback` is the
-    /// clipboard to paste an image or text from instead if the list holds
-    /// no local files (e.g. a copied web link).
-    Files { fallback: Option<DataTransferId> },
+    /// The `text/uri-list` of a drop.
+    Drop,
     /// Text for the focused text field.
     Field,
-    /// Text pasted outside a text field, for the app.
-    Text,
-    /// An image pasted outside a text field, in this format.
+    /// One form of a paste outside a text field, collected in [`Gather`].
+    Files,
     Image { extension: &'static str },
-    /// The image half of a paste that offered both an image and text.
-    EitherImage { extension: &'static str },
-    /// The text half of that paste.
-    EitherText,
+    Text,
 }
 
 impl Fetch {
-    fn is_either(&self) -> bool {
-        matches!(self, Fetch::EitherImage { .. } | Fetch::EitherText)
+    fn is_gather(&self) -> bool {
+        matches!(self, Fetch::Files | Fetch::Image { .. } | Fetch::Text)
     }
 }
 
-/// The halves of a paste that offered both an image and text, as they
-/// arrive: `None` while pending, `Some(None)` when unreadable or empty.
+/// A paste outside a text field: every form the clipboard offers is read,
+/// then handed over at once as a [`Pasted`].
 #[derive(Default)]
-struct Either {
-    image: Option<Option<(Vec<u8>, &'static str)>>,
-    text: Option<Option<String>>,
+struct Gather {
+    /// Forms still being read.
+    waiting: usize,
+    uris: Vec<String>,
+    image: Option<(Vec<u8>, &'static str)>,
+    text: Option<String>,
+    /// The last read that failed.
+    error: Option<String>,
 }
-
-const NOTHING_TO_PASTE: &str = "The clipboard holds nothing that can be sent (no files, image or text).";
 
 /// Image formats taken from the clipboard, most preferred first. Programs
 /// that copy an image usually offer several; PNG is lossless and readable
@@ -150,7 +185,7 @@ struct Runner<A: App> {
     out: Rc<RefCell<Outcome>>,
     /// Drop and clipboard requests, answered by `DataTransferReceived`.
     fetches: Vec<(AsyncRequestSerial, Fetch)>,
-    either: Either,
+    gather: Gather,
     frames: u64,
     builds: u64,
     started: std::time::Instant,
@@ -188,7 +223,7 @@ pub fn run<A: App>(make: impl FnOnce(EventLoopProxy) -> A) -> Result<(), String>
         cursor: CursorIcon::Default,
         out: out.clone(),
         fetches: Vec::new(),
-        either: Either::default(),
+        gather: Gather::default(),
         frames: 0,
         builds: 0,
         started,
@@ -330,84 +365,72 @@ impl<A: App> Runner<A> {
     }
 
     /// Reads the clipboard: text into the focused text field (`field`), or
-    /// else for the app: copied files, or an image or text when there are
-    /// none.
+    /// else everything it holds, for [`App::pasted`].
     fn paste(&mut self, event_loop: &dyn ActiveEventLoop, field: bool) {
         let id = match event_loop.clipboard() {
-            Ok(Some(id)) => id,
-            Ok(None) if field => return,
-            Ok(None) => return self.clipboard_error("The clipboard is empty.".into(), event_loop),
+            Ok(id) => id,
             Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
         };
-        let (files, image, text) = event_loop.data_transfer(id).map_or((false, None, false), |dt| {
-            (dt.has_type(&TypeHint::UriList), image_type(&*dt), dt.has_type(&TypeHint::Plaintext))
-        });
+        let (files, image, text) = id.and_then(|id| event_loop.data_transfer(id).ok()).map_or(
+            (false, None, false),
+            |dt| (dt.has_type(&TypeHint::UriList), image_type(&*dt), dt.has_type(&TypeHint::Plaintext)),
+        );
         if self.trace {
             eprintln!("vkui: paste field={field} files={files} image={image:?} text={text}");
         }
-        let result = match (field, files) {
-            (true, _) if text => self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Field),
-            (true, _) => return,
-            (false, true) => {
-                let fallback = (image.is_some() || text).then_some(id);
-                self.fetch(event_loop, id, TypeHint::UriList, Fetch::Files { fallback })
+        if field {
+            if let Some(id) = id
+                && text
+                && let Err(e) = self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Field)
+            {
+                self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
             }
-            (false, false) => return self.paste_media(event_loop, id, image, text),
-        };
-        if let Err(e) = result {
-            self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
-        }
-    }
-
-    /// The image or text of a clipboard whose file list held no local files.
-    fn paste_fallback(&mut self, event_loop: &dyn ActiveEventLoop, id: DataTransferId) {
-        let (image, text) = event_loop.data_transfer(id).map_or((None, false), |dt| {
-            (image_type(&*dt), dt.has_type(&TypeHint::Plaintext))
-        });
-        self.paste_media(event_loop, id, image, text);
-    }
-
-    /// Pastes the clipboard's image or text for the app; with both, reads
-    /// both and lets the app pick ([`App::pasted_either`]).
-    fn paste_media(
-        &mut self,
-        event_loop: &dyn ActiveEventLoop,
-        id: DataTransferId,
-        image: Option<&'static str>,
-        text: bool,
-    ) {
-        let image_hint = |extension| TypeHint::Image { extension_hint: Some(extension) };
-        let result = match (image, text) {
-            (Some(extension), true) => {
-                // A newer paste replaces one still being read.
-                self.fetches.retain(|(_, fetch)| !fetch.is_either());
-                self.either = Either::default();
-                self.fetch(event_loop, id, image_hint(extension), Fetch::EitherImage { extension })
-                    .and_then(|()| self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::EitherText))
-            }
-            (Some(extension), false) => self.fetch(event_loop, id, image_hint(extension), Fetch::Image { extension }),
-            (None, true) => self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Text),
-            (None, false) => return self.clipboard_error(NOTHING_TO_PASTE.into(), event_loop),
-        };
-        if let Err(e) = result {
-            self.fetches.retain(|(_, fetch)| !fetch.is_either());
-            self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
-        }
-    }
-
-    /// Hands a paste of both an image and text to the app once both halves
-    /// have arrived, or just the half that could be read.
-    fn either_received(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if self.either.image.is_none() || self.either.text.is_none() {
             return;
         }
-        let either = std::mem::take(&mut self.either);
-        match (either.image.flatten(), either.text.flatten()) {
-            (Some((data, extension)), Some(text)) => self.app.pasted_either(data, extension, text),
-            (Some((data, extension)), None) => self.app.pasted_image(data, extension),
-            (None, Some(text)) => self.app.pasted(text),
-            (None, None) => self.clipboard_error("Cannot read the clipboard.".into(), event_loop),
+        // A newer paste replaces one still being read.
+        self.fetches.retain(|(_, fetch)| !fetch.is_gather());
+        self.gather = Gather::default();
+        if let Some(id) = id {
+            let mut forms = Vec::new();
+            if files {
+                forms.push((TypeHint::UriList, Fetch::Files));
+            }
+            if let Some(extension) = image {
+                forms.push((TypeHint::Image { extension_hint: Some(extension) }, Fetch::Image { extension }));
+            }
+            if text {
+                forms.push((TypeHint::Plaintext, Fetch::Text));
+            }
+            for (hint, fetch) in forms {
+                match self.fetch(event_loop, id, hint, fetch) {
+                    Ok(()) => self.gather.waiting += 1,
+                    Err(e) => self.gather.error = Some(e.to_string()),
+                }
+            }
         }
+        if self.gather.waiting == 0 {
+            self.gathered(event_loop);
+        }
+    }
+
+    /// Hands a paste to the app once every form has been read.
+    fn gathered(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let gather = std::mem::take(&mut self.gather);
+        let mut pasted = Pasted { files: uri_paths(&gather.uris), image: gather.image, text: gather.text };
+        pasted.drop_repeats(&gather.uris);
+        if self.trace {
+            eprintln!(
+                "vkui: pasted files={:?} image={:?} text={}",
+                pasted.files,
+                pasted.image.as_ref().map(|(data, extension)| (data.len(), extension)),
+                pasted.text.is_some()
+            );
+        }
+        if let (0, Some(e)) = (pasted.kinds(), gather.error) {
+            return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
+        }
+        self.app.pasted(pasted);
+        self.rebuild(false, event_loop);
     }
 
     fn fetch(
@@ -424,54 +447,40 @@ impl<A: App> Runner<A> {
 
     fn received(&mut self, event_loop: &dyn ActiveEventLoop, fetch: Fetch, value: &dyn TypedData) {
         match fetch {
-            Fetch::Files { fallback } => {
+            Fetch::Drop => {
                 let uris = value.try_as_uris();
                 if self.trace {
-                    eprintln!("vkui: received {uris:?}");
+                    eprintln!("vkui: dropped {uris:?}");
                 }
-                let paths = uris.map(|uris| uri_paths(&uris)).unwrap_or_default();
-                if paths.is_empty() {
-                    if let Some(id) = fallback {
-                        self.paste_fallback(event_loop, id);
-                    }
-                    return;
-                }
-                for path in paths {
+                for path in uris.map(|uris| uri_paths(&uris)).unwrap_or_default() {
                     self.app.dropped(path);
                 }
             }
-            Fetch::Field | Fetch::Text => {
-                let text = match value.try_as_string() {
-                    Ok(text) => text,
-                    Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
+            Fetch::Field => match value.try_as_string() {
+                Ok(text) => {
+                    if let Some(ui) = &mut self.ui {
+                        ui.paste(&text);
+                    }
+                }
+                Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
+            },
+            Fetch::Files | Fetch::Image { .. } | Fetch::Text => {
+                let gather = &mut self.gather;
+                let result = match fetch {
+                    Fetch::Files => value.try_as_uris().map(|uris| gather.uris = uris),
+                    Fetch::Image { extension } => value
+                        .try_as_bytes()
+                        .map(|data| gather.image = (!data.is_empty()).then_some((data, extension))),
+                    _ => value.try_as_string().map(|text| gather.text = (!text.trim().is_empty()).then_some(text)),
                 };
-                match (fetch, &mut self.ui) {
-                    (Fetch::Field, Some(ui)) => ui.paste(&text),
-                    _ => self.app.pasted(text),
+                if let Err(e) = result {
+                    gather.error = Some(e.to_string());
                 }
-            }
-            Fetch::Image { extension } => {
-                let data = match value.try_as_bytes() {
-                    Ok(data) if !data.is_empty() => data,
-                    Ok(_) => return self.clipboard_error("The copied image is empty.".into(), event_loop),
-                    Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
-                };
-                if self.trace {
-                    eprintln!("vkui: received a {extension} image of {} bytes", data.len());
+                gather.waiting -= 1;
+                if gather.waiting == 0 {
+                    return self.gathered(event_loop);
                 }
-                self.app.pasted_image(data, extension);
-            }
-            Fetch::EitherImage { extension } => {
-                let data = value.try_as_bytes().ok().filter(|data| !data.is_empty());
-                if self.trace {
-                    eprintln!("vkui: received a {extension} image of {:?} bytes (with text)", data.as_ref().map(Vec::len));
-                }
-                self.either.image = Some(data.map(|data| (data, extension)));
-                self.either_received(event_loop);
-            }
-            Fetch::EitherText => {
-                self.either.text = Some(value.try_as_string().ok().filter(|text| !text.trim().is_empty()));
-                self.either_received(event_loop);
+                return;
             }
         }
         self.rebuild(false, event_loop);
@@ -490,7 +499,7 @@ impl<A: App> Runner<A> {
             let actions: &[DndAction] = if files { &[DndAction::Copy] } else { &[] };
             let _ = event_loop.set_valid_dnd_actions(id, actions);
         } else if files {
-            let _ = self.fetch(event_loop, id, TypeHint::UriList, Fetch::Files { fallback: None });
+            let _ = self.fetch(event_loop, id, TypeHint::UriList, Fetch::Drop);
         }
         if self.trace {
             eprintln!("vkui: drag dropped={dropped} files={files}");
@@ -653,5 +662,40 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod paste_tests {
+    use super::*;
+
+    #[test]
+    fn pasted_repeats() {
+        let dir = std::env::temp_dir().join(format!("vkui-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a b.png");
+        std::fs::write(&file, b"PNG").unwrap();
+        let uri = format!("file://{}", file.display().to_string().replace(' ', "%20"));
+        let paste = |image: &[u8], text: &str| {
+            let mut pasted = Pasted {
+                files: uri_paths(std::slice::from_ref(&uri)),
+                image: Some((image.to_vec(), "png")),
+                text: Some(text.to_string()),
+            };
+            pasted.drop_repeats(std::slice::from_ref(&uri));
+            pasted
+        };
+        // A file manager: the file, its path or URI as text, and its content
+        // as an image are one thing.
+        let pasted = paste(b"PNG", &format!("{}\n", file.display()));
+        assert_eq!((pasted.files.len(), pasted.image.is_some(), pasted.text.is_some()), (1, false, false));
+        assert_eq!(paste(b"PNG", &uri).text, None);
+        // Different things offered together are all kept.
+        let pasted = paste(b"other image", "some words");
+        assert_eq!((pasted.files.len(), pasted.image.is_some(), pasted.text.is_some()), (1, true, true));
+        assert_eq!(pasted.kinds(), 3);
+        // Text that lists the file and more is not a repeat.
+        assert!(paste(b"PNG", &format!("{}\nand more", file.display())).text.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

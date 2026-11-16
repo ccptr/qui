@@ -77,6 +77,13 @@ pub trait App: 'static {
     /// ("png", "jpg", ...).
     fn pasted_image(&mut self, _data: Vec<u8>, _extension: &'static str) {}
 
+    /// The clipboard offered both an image and text (and no files), e.g. a
+    /// copied image with its address, or rich text along with a picture of
+    /// it: the app picks one, e.g. by asking. Default: the image.
+    fn pasted_either(&mut self, image: Vec<u8>, extension: &'static str, _text: String) {
+        self.pasted_image(image, extension);
+    }
+
     /// Copying to or pasting from the clipboard failed.
     fn clipboard_error(&mut self, _error: String) {}
 }
@@ -94,7 +101,27 @@ enum Fetch {
     Text,
     /// An image pasted outside a text field, in this format.
     Image { extension: &'static str },
+    /// The image half of a paste that offered both an image and text.
+    EitherImage { extension: &'static str },
+    /// The text half of that paste.
+    EitherText,
 }
+
+impl Fetch {
+    fn is_either(&self) -> bool {
+        matches!(self, Fetch::EitherImage { .. } | Fetch::EitherText)
+    }
+}
+
+/// The halves of a paste that offered both an image and text, as they
+/// arrive: `None` while pending, `Some(None)` when unreadable or empty.
+#[derive(Default)]
+struct Either {
+    image: Option<Option<(Vec<u8>, &'static str)>>,
+    text: Option<Option<String>>,
+}
+
+const NOTHING_TO_PASTE: &str = "The clipboard holds nothing that can be sent (no files, image or text).";
 
 /// Image formats taken from the clipboard, most preferred first. Programs
 /// that copy an image usually offer several; PNG is lossless and readable
@@ -124,6 +151,7 @@ struct Runner<A: App> {
     out: Rc<RefCell<Outcome>>,
     /// Drop and clipboard requests, answered by `DataTransferReceived`.
     fetches: Vec<(AsyncRequestSerial, Fetch)>,
+    either: Either,
     frames: u64,
     builds: u64,
     started: std::time::Instant,
@@ -161,6 +189,7 @@ pub fn run<A: App>(make: impl FnOnce(EventLoopProxy) -> A) -> Result<(), String>
         cursor: CursorIcon::Default,
         out: out.clone(),
         fetches: Vec::new(),
+        either: Either::default(),
         frames: 0,
         builds: 0,
         started,
@@ -317,41 +346,68 @@ impl<A: App> Runner<A> {
         if self.trace {
             eprintln!("vkui: paste field={field} files={files} image={image:?} text={text}");
         }
-        let (hint, fetch) = match (field, files, image, text) {
-            (true, _, _, true) => (TypeHint::Plaintext, Fetch::Field),
-            (true, ..) => return,
-            (false, true, ..) => {
+        let result = match (field, files) {
+            (true, _) if text => self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Field),
+            (true, _) => return,
+            (false, true) => {
                 let fallback = (image.is_some() || text).then_some(id);
-                (TypeHint::UriList, Fetch::Files { fallback })
+                self.fetch(event_loop, id, TypeHint::UriList, Fetch::Files { fallback })
             }
-            (false, false, Some(extension), _) => {
-                (TypeHint::Image { extension_hint: Some(extension) }, Fetch::Image { extension })
-            }
-            (false, false, None, true) => (TypeHint::Plaintext, Fetch::Text),
-            (false, false, None, false) => {
-                let error = "The clipboard holds nothing that can be sent (no files, image or text).";
-                return self.clipboard_error(error.into(), event_loop);
-            }
+            (false, false) => return self.paste_media(event_loop, id, image, text),
         };
-        if let Err(e) = self.fetch(event_loop, id, hint, fetch) {
+        if let Err(e) = result {
             self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
         }
     }
 
     /// The image or text of a clipboard whose file list held no local files.
     fn paste_fallback(&mut self, event_loop: &dyn ActiveEventLoop, id: DataTransferId) {
-        let image = event_loop.data_transfer(id).ok().and_then(|dt| image_type(&*dt));
-        let result = match image {
-            Some(extension) => self.fetch(
-                event_loop,
-                id,
-                TypeHint::Image { extension_hint: Some(extension) },
-                Fetch::Image { extension },
-            ),
-            None => self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Text),
+        let (image, text) = event_loop.data_transfer(id).map_or((None, false), |dt| {
+            (image_type(&*dt), dt.has_type(&TypeHint::Plaintext))
+        });
+        self.paste_media(event_loop, id, image, text);
+    }
+
+    /// Pastes the clipboard's image or text for the app; with both, reads
+    /// both and lets the app pick ([`App::pasted_either`]).
+    fn paste_media(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        id: DataTransferId,
+        image: Option<&'static str>,
+        text: bool,
+    ) {
+        let image_hint = |extension| TypeHint::Image { extension_hint: Some(extension) };
+        let result = match (image, text) {
+            (Some(extension), true) => {
+                // A newer paste replaces one still being read.
+                self.fetches.retain(|(_, fetch)| !fetch.is_either());
+                self.either = Either::default();
+                self.fetch(event_loop, id, image_hint(extension), Fetch::EitherImage { extension })
+                    .and_then(|()| self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::EitherText))
+            }
+            (Some(extension), false) => self.fetch(event_loop, id, image_hint(extension), Fetch::Image { extension }),
+            (None, true) => self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Text),
+            (None, false) => return self.clipboard_error(NOTHING_TO_PASTE.into(), event_loop),
         };
         if let Err(e) = result {
+            self.fetches.retain(|(_, fetch)| !fetch.is_either());
             self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
+        }
+    }
+
+    /// Hands a paste of both an image and text to the app once both halves
+    /// have arrived, or just the half that could be read.
+    fn either_received(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.either.image.is_none() || self.either.text.is_none() {
+            return;
+        }
+        let either = std::mem::take(&mut self.either);
+        match (either.image.flatten(), either.text.flatten()) {
+            (Some((data, extension)), Some(text)) => self.app.pasted_either(data, extension, text),
+            (Some((data, extension)), None) => self.app.pasted_image(data, extension),
+            (None, Some(text)) => self.app.pasted(text),
+            (None, None) => self.clipboard_error("Cannot read the clipboard.".into(), event_loop),
         }
     }
 
@@ -405,6 +461,18 @@ impl<A: App> Runner<A> {
                     eprintln!("vkui: received a {extension} image of {} bytes", data.len());
                 }
                 self.app.pasted_image(data, extension);
+            }
+            Fetch::EitherImage { extension } => {
+                let data = value.try_as_bytes().ok().filter(|data| !data.is_empty());
+                if self.trace {
+                    eprintln!("vkui: received a {extension} image of {:?} bytes (with text)", data.as_ref().map(Vec::len));
+                }
+                self.either.image = Some(data.map(|data| (data, extension)));
+                self.either_received(event_loop);
+            }
+            Fetch::EitherText => {
+                self.either.text = Some(value.try_as_string().ok().filter(|text| !text.trim().is_empty()));
+                self.either_received(event_loop);
             }
         }
         self.rebuild(false, event_loop);

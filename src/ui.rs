@@ -9,9 +9,9 @@
 use crate::gfx::{Batch, Quad};
 use crate::text::{ATLAS, Text};
 use std::collections::HashMap;
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::CursorIcon;
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::cursor::CursorIcon;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -196,6 +196,10 @@ pub struct Ui {
     modifiers: ModifiersState,
     keys: Vec<KeyPress>,
     typed: String,
+    /// Clipboard text for the focused field, delivered by [`Ui::paste`].
+    pasted: String,
+    /// Ctrl+V (or Shift+Insert) was pressed; the runner reads the clipboard.
+    pub(crate) paste_key: bool,
     /// Widget the mouse went down on.
     active: Option<Id>,
     pub focus: Option<Id>,
@@ -230,6 +234,8 @@ impl Ui {
             modifiers: ModifiersState::empty(),
             keys: Vec::new(),
             typed: String::new(),
+            pasted: String::new(),
+            paste_key: false,
             active: None,
             focus: None,
             focus_seen: false,
@@ -244,21 +250,19 @@ impl Ui {
     /// Feeds a window event. Returns whether the UI must be rebuilt.
     pub fn event(&mut self, event: &WindowEvent) -> bool {
         match event {
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::PointerMoved { position, primary: true, .. } => {
                 self.mouse = (position.x as f32 / self.scale, position.y as f32 / self.scale);
                 self.outside = false;
                 true
             }
-            WindowEvent::CursorLeft { .. } => {
+            WindowEvent::PointerLeft { primary: true, .. } => {
                 self.outside = true;
                 self.mouse = (-1.0, -1.0);
                 true
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
+            WindowEvent::PointerButton { state, button, primary: true, .. }
+                if button.clone().mouse_button() == Some(MouseButton::Left) =>
+            {
                 match state {
                     ElementState::Pressed => {
                         self.mouse_down = true;
@@ -276,6 +280,7 @@ impl Ui {
                 self.wheel += match delta {
                     MouseScrollDelta::LineDelta(_, y) => y * 48.0,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / self.scale,
+                    _ => return false,
                 };
                 true
             }
@@ -288,6 +293,10 @@ impl Ui {
                 true
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if is_paste(event, self.ctrl(), self.modifiers.shift_key()) {
+                    self.paste_key = true;
+                    return false;
+                }
                 let key = match &event.logical_key {
                     Key::Named(NamedKey::Backspace) => Some(KeyPress::Back),
                     Key::Named(NamedKey::Delete) => Some(KeyPress::Delete),
@@ -304,7 +313,7 @@ impl Ui {
                     self.keys.push(key);
                 } else if let Some(text) = &event.text
                     && !self.modifiers.control_key()
-                    && !self.modifiers.super_key()
+                    && !self.modifiers.meta_key()
                 {
                     self.typed.extend(text.chars().filter(|c| !c.is_control()));
                 }
@@ -348,6 +357,7 @@ impl Ui {
         self.wheel = 0.0;
         self.keys.clear();
         self.typed.clear();
+        self.pasted.clear();
         if !self.focus_seen {
             self.focus = None;
         }
@@ -360,7 +370,17 @@ impl Ui {
     }
 
     pub fn ctrl(&self) -> bool {
-        self.modifiers.control_key() || self.modifiers.super_key()
+        self.modifiers.control_key() || self.modifiers.meta_key()
+    }
+
+    /// Clipboard text for the focused text field, inserted on the next build.
+    pub(crate) fn paste(&mut self, text: &str) {
+        self.pasted = text
+            .replace("\r\n", "\n")
+            .chars()
+            .map(|c| if c == '\t' || c == '\r' { ' ' } else { c })
+            .filter(|&c| c == '\n' || !c.is_control())
+            .collect();
     }
 
     // ---- drawing ------------------------------------------------------------
@@ -660,10 +680,15 @@ impl Ui {
 
         let mut edit = Edit::None;
         if focused && !self.blocked {
-            if !self.typed.is_empty() {
-                value.insert_str(cursor, &self.typed);
-                cursor += self.typed.len();
-                edit = Edit::Changed;
+            // A single-line field takes a pasted line without its line
+            // break, and several lines joined by spaces.
+            let pasted = if multiline { self.pasted.clone() } else { self.pasted.trim().replace('\n', " ") };
+            for s in [&self.typed, &pasted] {
+                if !s.is_empty() {
+                    value.insert_str(cursor, s);
+                    cursor += s.len();
+                    edit = Edit::Changed;
+                }
             }
             let prev = |s: &str, i: usize| s[..i].char_indices().last().map_or(0, |(j, _)| j);
             let next = |s: &str, i: usize| s[i..].chars().next().map_or(i, |c| i + c.len_utf8());
@@ -736,5 +761,20 @@ impl Ui {
         }
         self.pop_clip();
         edit
+    }
+}
+
+/// Paste shortcuts: Ctrl+V (also Cmd+V and Ctrl+Shift+V), Shift+Insert and
+/// the Paste key. V is matched on the layout's own letter, or where V is on
+/// a US keyboard for layouts without Latin letters.
+fn is_paste(event: &KeyEvent, ctrl: bool, shift: bool) -> bool {
+    match &event.logical_key {
+        Key::Named(NamedKey::Paste) => return true,
+        Key::Named(NamedKey::Insert) => return shift && !ctrl,
+        _ => {}
+    }
+    ctrl && match &event.key_without_modifiers {
+        Key::Character(c) if c.is_ascii() => c.eq_ignore_ascii_case("v"),
+        _ => event.physical_key == PhysicalKey::Code(KeyCode::KeyV),
     }
 }

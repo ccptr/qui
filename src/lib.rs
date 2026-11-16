@@ -19,13 +19,19 @@ pub use ui::{Align, ButtonStyle, Color, Edit, Rect, Response, Theme, Ui, id};
 pub use winit;
 
 use gfx::{Batch, Gfx, Quad};
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::rc::Rc;
 use winit::application::ApplicationHandler;
+use winit::data_transfer::{DataTransferId, DataTransferSendBuilder, TransferType, TypeHint, TypedData};
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::event_loop::{ActiveEventLoop, AsyncRequestSerial, ControlFlow, DndAction, EventLoop, EventLoopProxy};
+use winit::cursor::CursorIcon;
+use winit::window::{
+    ImeCapabilities, ImeEnableRequest, ImeHint, ImePurpose, ImeRequest, ImeRequestData, Window,
+    WindowAttributes, WindowId,
+};
 
 /// Requests from the app to the runner during [`App::build`].
 #[derive(Default)]
@@ -35,13 +41,14 @@ pub struct Cx {
     /// dialog), so parts drawn earlier are stale: build once more. The
     /// input was consumed by the first pass.
     pub again: bool,
+    /// Put this text on the clipboard.
+    pub copy: Option<String>,
+    /// Paste as if Ctrl+V was pressed outside a text field: copied files
+    /// go to [`App::dropped`], text to [`App::pasted`].
+    pub paste: bool,
 }
 
 pub trait App: 'static {
-    /// Events the app sends itself through the [`EventLoopProxy`] (e.g.
-    /// "the engine state changed").
-    type Event: 'static + Send;
-
     fn title(&self) -> String;
 
     /// Wayland app id / X11 class, matched against `.desktop` files.
@@ -52,23 +59,47 @@ pub trait App: 'static {
     /// Builds the whole UI for this frame.
     fn build(&mut self, ui: &mut Ui, cx: &mut Cx);
 
-    /// An app event arrived; return whether the UI must be rebuilt.
-    fn event(&mut self, event: Self::Event) -> bool;
+    /// Something woke the loop through the [`EventLoopProxy`] (e.g. "the
+    /// engine state changed"); return whether the UI must be rebuilt.
+    /// Wake-ups are coalesced: several `wake_up` calls may arrive as one.
+    fn woken(&mut self) -> bool;
 
-    /// A file was dropped onto the window.
+    /// A file was dropped onto the window, or pasted outside a text field.
     fn dropped(&mut self, _path: PathBuf) {}
+
+    /// Text was pasted outside a text field (and there were no copied files).
+    fn pasted(&mut self, _text: String) {}
+
+    /// Copying to or pasting from the clipboard failed.
+    fn clipboard_error(&mut self, _error: String) {}
+}
+
+/// What a pending `fetch_data_transfer` is for.
+#[derive(Clone, Copy, Debug)]
+enum Fetch {
+    /// A `text/uri-list`, from a drop or a paste. `text` is the clipboard
+    /// to read as text instead if the list holds no local files (e.g. a
+    /// copied web link).
+    Files { text: Option<DataTransferId> },
+    /// Text for the focused text field.
+    Field,
+    /// Text pasted outside a text field, for the app.
+    Text,
 }
 
 struct Runner<A: App> {
     app: A,
-    window: Option<Arc<Window>>,
+    window: Option<Box<dyn Window>>,
     gfx: Option<Gfx>,
     ui: Option<Ui>,
     /// The last built frame, drawn on redraw.
     quads: Vec<Quad>,
     batches: Vec<Batch>,
     cursor: CursorIcon,
-    error: Option<String>,
+    /// Shared with [`run`], which gets the handler back only by value.
+    out: Rc<RefCell<Outcome>>,
+    /// Drop and clipboard requests, answered by `DataTransferReceived`.
+    fetches: Vec<(AsyncRequestSerial, Fetch)>,
     frames: u64,
     builds: u64,
     started: std::time::Instant,
@@ -77,18 +108,26 @@ struct Runner<A: App> {
     trace: bool,
 }
 
-/// Opens the window and runs until it is closed. `make` gets a proxy for
-/// sending [`App::Event`]s from other threads.
-pub fn run<A: App>(make: impl FnOnce(EventLoopProxy<A::Event>) -> A) -> Result<(), String> {
+#[derive(Default)]
+struct Outcome {
+    error: Option<String>,
+    builds: u64,
+    frames: u64,
+}
+
+/// Opens the window and runs until it is closed. `make` gets a proxy whose
+/// `wake_up` calls [`App::woken`] on the UI thread; it can be used from any
+/// thread.
+pub fn run<A: App>(make: impl FnOnce(EventLoopProxy) -> A) -> Result<(), String> {
     // RLS_STATS times frames from here, so `make` (the app's own start-up)
     // counts too.
     let started = std::time::Instant::now();
-    let event_loop = EventLoop::<A::Event>::with_user_event()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let app = make(event_loop.create_proxy());
-    let mut runner = Runner {
+    let out = Rc::new(RefCell::new(Outcome::default()));
+    let stats = std::env::var_os("RLS_STATS").is_some();
+    let runner = Runner {
         app,
         window: None,
         gfx: None,
@@ -96,30 +135,92 @@ pub fn run<A: App>(make: impl FnOnce(EventLoopProxy<A::Event>) -> A) -> Result<(
         quads: Vec::new(),
         batches: Vec::new(),
         cursor: CursorIcon::Default,
-        error: None,
+        out: out.clone(),
+        fetches: Vec::new(),
         frames: 0,
         builds: 0,
         started,
-        stats: std::env::var_os("RLS_STATS").is_some(),
+        stats,
         trace: std::env::var_os("RLS_EVENTS").is_some(),
     };
-    event_loop.run_app(&mut runner).map_err(|e| e.to_string())?;
-    if runner.stats {
-        eprintln!("vkui: {} builds, {} frames", runner.builds, runner.frames);
+    event_loop.run_app(runner).map_err(|e| e.to_string())?;
+    let out = out.take();
+    if stats {
+        eprintln!("vkui: {} builds, {} frames", out.builds, out.frames);
     }
-    match runner.error {
+    match out.error {
         Some(error) => Err(error),
         None => Ok(()),
     }
 }
 
+/// `file://` URIs from a `text/uri-list` drop as local paths. Other schemes
+/// (e.g. `https://` from a browser) and other hosts are skipped.
+fn uri_paths(uris: &[String]) -> Vec<PathBuf> {
+    uris.iter().filter_map(|uri| uri_path(uri.trim())).collect()
+}
+
+fn uri_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///p` or `file://localhost/p`.
+    let path = if rest.starts_with('/') { rest } else { rest.strip_prefix("localhost")? };
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut it = path.bytes();
+    while let Some(b) = it.next() {
+        if b == b'%' {
+            let hex = [it.next()?, it.next()?];
+            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            bytes.push(b);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        // `file:///C:/x` is `C:/x`.
+        let path = String::from_utf8(bytes).ok()?;
+        let path = match path.as_bytes() {
+            [b'/', d, b':', ..] if d.is_ascii_alphabetic() => &path[1..],
+            _ => &path[..],
+        };
+        Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_uris() {
+        let uris = [
+            "file:///home/a/My%20File.txt",
+            "file://localhost/tmp/x",
+            "file://otherhost/tmp/y",
+            "https://example.com/z",
+            "file:///bad%2",
+            "file:///caf%C3%A9 \r",
+        ]
+        .map(String::from);
+        let paths = uri_paths(&uris);
+        assert_eq!(
+            paths,
+            ["/home/a/My File.txt", "/tmp/x", "/caf\u{e9}"].map(PathBuf::from)
+        );
+    }
+}
+
 impl<A: App> Runner<A> {
     /// Rebuilds the UI; requests a redraw if the output changed.
-    fn rebuild(&mut self, force: bool, event_loop: &ActiveEventLoop) {
+    fn rebuild(&mut self, force: bool, event_loop: &dyn ActiveEventLoop) {
         let (Some(window), Some(ui)) = (&self.window, &mut self.ui) else {
             return;
         };
-        let size = window.inner_size();
+        let size = window.surface_size();
         let scale = window.scale_factor() as f32;
         let mut cx = Cx::default();
         // A glyph-atlas reset invalidates the frame; the next pass then
@@ -150,58 +251,187 @@ impl<A: App> Runner<A> {
         }
         if ui.cursor != self.cursor {
             self.cursor = ui.cursor;
-            window.set_cursor(self.cursor);
+            window.set_cursor(self.cursor.into());
         }
         if cx.close {
             event_loop.exit();
         }
+        if let Some(text) = cx.copy.take() {
+            let data = DataTransferSendBuilder::new(text)
+                .with_type(TypeHint::Plaintext, |text: &String, _: &dyn TransferType| Some(text.clone()))
+                .build();
+            if let Err(e) = event_loop.set_clipboard(data) {
+                self.clipboard_error(format!("Cannot copy to the clipboard: {e}"), event_loop);
+            }
+        }
+        if cx.paste {
+            self.paste(event_loop, false);
+        }
     }
 
-    fn fail(&mut self, error: String, event_loop: &ActiveEventLoop) {
-        self.error = Some(error);
+    fn clipboard_error(&mut self, error: String, event_loop: &dyn ActiveEventLoop) {
+        if self.trace {
+            eprintln!("vkui: {error}");
+        }
+        self.app.clipboard_error(error);
+        self.rebuild(false, event_loop);
+    }
+
+    /// Reads the clipboard: text into the focused text field (`field`), or
+    /// else copied files, or text when there are none, for the app.
+    fn paste(&mut self, event_loop: &dyn ActiveEventLoop, field: bool) {
+        let id = match event_loop.clipboard() {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
+        };
+        let (files, text) = event_loop.data_transfer(id).map_or((false, false), |dt| {
+            (dt.has_type(&TypeHint::UriList), dt.has_type(&TypeHint::Plaintext))
+        });
+        let (hint, fetch) = match (field, files, text) {
+            (true, _, true) => (TypeHint::Plaintext, Fetch::Field),
+            (false, true, _) => (TypeHint::UriList, Fetch::Files { text: text.then_some(id) }),
+            (false, false, true) => (TypeHint::Plaintext, Fetch::Text),
+            _ => return,
+        };
+        if self.trace {
+            eprintln!("vkui: paste {fetch:?} files={files} text={text}");
+        }
+        if let Err(e) = self.fetch(event_loop, id, hint, fetch) {
+            self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop);
+        }
+    }
+
+    fn fetch(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        id: DataTransferId,
+        hint: TypeHint,
+        fetch: Fetch,
+    ) -> Result<(), winit::error::TransferError> {
+        let serial = event_loop.fetch_data_transfer(id, &hint)?;
+        self.fetches.push((serial, fetch));
+        Ok(())
+    }
+
+    fn received(&mut self, event_loop: &dyn ActiveEventLoop, fetch: Fetch, value: &dyn TypedData) {
+        match fetch {
+            Fetch::Files { text } => {
+                let uris = value.try_as_uris();
+                if self.trace {
+                    eprintln!("vkui: received {uris:?}");
+                }
+                let paths = uris.map(|uris| uri_paths(&uris)).unwrap_or_default();
+                if paths.is_empty() {
+                    if let Some(id) = text {
+                        let _ = self.fetch(event_loop, id, TypeHint::Plaintext, Fetch::Text);
+                    }
+                    return;
+                }
+                for path in paths {
+                    self.app.dropped(path);
+                }
+            }
+            Fetch::Field | Fetch::Text => {
+                let text = match value.try_as_string() {
+                    Ok(text) => text,
+                    Err(e) => return self.clipboard_error(format!("Cannot read the clipboard: {e}"), event_loop),
+                };
+                match (fetch, &mut self.ui) {
+                    (Fetch::Field, Some(ui)) => ui.paste(&text),
+                    _ => self.app.pasted(text),
+                }
+            }
+        }
+        self.rebuild(false, event_loop);
+    }
+
+    fn fail(&mut self, error: String, event_loop: &dyn ActiveEventLoop) {
+        self.out.borrow_mut().error = Some(error);
         event_loop.exit();
+    }
+
+    /// Drops: only files are accepted (`text/uri-list`), and the list is
+    /// fetched once, on the drop itself, not while hovering.
+    fn drag(&mut self, event_loop: &dyn ActiveEventLoop, id: DataTransferId, dropped: bool) {
+        let files = event_loop.data_transfer(id).is_ok_and(|dt| dt.has_type(&TypeHint::UriList));
+        if !dropped {
+            let actions: &[DndAction] = if files { &[DndAction::Copy] } else { &[] };
+            let _ = event_loop.set_valid_dnd_actions(id, actions);
+        } else if files {
+            let _ = self.fetch(event_loop, id, TypeHint::UriList, Fetch::Files { text: None });
+        }
+        if self.trace {
+            eprintln!("vkui: drag dropped={dropped} files={files}");
+        }
     }
 }
 
-impl<A: App> ApplicationHandler<A::Event> for Runner<A> {
-    fn new_events(&mut self, _: &ActiveEventLoop, cause: winit::event::StartCause) {
+impl<A: App> Drop for Runner<A> {
+    fn drop(&mut self) {
+        let mut out = self.out.borrow_mut();
+        out.builds = self.builds;
+        out.frames = self.frames;
+    }
+}
+
+impl<A: App> ApplicationHandler for Runner<A> {
+    fn new_events(&mut self, _: &dyn ActiveEventLoop, cause: winit::event::StartCause) {
         if self.trace {
             eprintln!("vkui: {:>8} ms wake {cause:?}", self.started.elapsed().as_millis());
         }
     }
 
-    fn device_event(&mut self, _: &ActiveEventLoop, _: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+    fn device_event(
+        &mut self,
+        _: &dyn ActiveEventLoop,
+        _: Option<winit::event::DeviceId>,
+        event: winit::event::DeviceEvent,
+    ) {
         if self.trace {
             eprintln!("vkui: device {event:?}");
         }
     }
 
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.window.is_some() {
             return;
         }
-        let attributes = Window::default_attributes()
+        let attributes = WindowAttributes::default()
             .with_title(self.app.title())
-            .with_inner_size(LogicalSize::new(440.0, 700.0))
-            .with_min_inner_size(LogicalSize::new(340.0, 420.0));
+            .with_surface_size(LogicalSize::new(440.0, 700.0))
+            .with_min_surface_size(LogicalSize::new(340.0, 420.0));
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
         let attributes = {
+            use winit::platform::{wayland, x11};
             let app_id = self.app.app_id().to_string();
-            let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
-                attributes, &app_id, "",
-            );
-            winit::platform::x11::WindowAttributesExtX11::with_name(attributes, &app_id, &app_id)
+            if wayland::ActiveEventLoopExtWayland::is_wayland(event_loop) {
+                attributes.with_platform_attributes(Box::new(
+                    wayland::WindowAttributesWayland::default().with_name(&app_id, ""),
+                ))
+            } else {
+                attributes.with_platform_attributes(Box::new(
+                    x11::WindowAttributesX11::default().with_name(&app_id, &app_id),
+                ))
+            }
         };
         let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
+            Ok(window) => window,
             Err(e) => return self.fail(format!("Cannot open a window: {e}"), event_loop),
         };
-        window.set_ime_allowed(true);
+        // Text input through the IME (compose, CJK); no cursor area is reported.
+        let ime = ImeEnableRequest::new(
+            ImeCapabilities::new().with_hint_and_purpose(),
+            ImeRequestData::default().with_hint_and_purpose(ImeHint::NONE, ImePurpose::Normal),
+        );
+        if let Some(ime) = ime {
+            let _ = window.request_ime_update(ImeRequest::Enable(ime));
+        }
         let theme = match window.theme() {
             Some(winit::window::Theme::Light) => Theme::LIGHT,
             _ => Theme::DARK,
         };
-        match (Gfx::new(&window), Ui::new(theme)) {
+        match (Gfx::new(&*window), Ui::new(theme)) {
             (Ok(gfx), Ok(ui)) => {
                 if self.stats {
                     eprintln!("vkui: rendering on {}", gfx.device_name);
@@ -215,19 +445,19 @@ impl<A: App> ApplicationHandler<A::Event> for Runner<A> {
         self.rebuild(true, event_loop);
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: A::Event) {
-        if self.app.event(event) {
+    fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.app.woken() {
             self.rebuild(false, event_loop);
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if self.trace {
             eprintln!("vkui: event {event:?}");
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 if let Some(gfx) = &mut self.gfx {
                     gfx.resize(size.width, size.height);
                 }
@@ -243,9 +473,13 @@ impl<A: App> ApplicationHandler<A::Event> for Runner<A> {
                 }
                 self.rebuild(true, event_loop);
             }
-            WindowEvent::DroppedFile(path) => {
-                self.app.dropped(path);
-                self.rebuild(false, event_loop);
+            WindowEvent::DragEntered { id, .. } => self.drag(event_loop, id, false),
+            WindowEvent::DragDropped { id, .. } => self.drag(event_loop, id, true),
+            WindowEvent::DataTransferReceived { serial, value, .. } => {
+                if let Some(i) = self.fetches.iter().position(|&(s, _)| s == serial) {
+                    let (_, fetch) = self.fetches.swap_remove(i);
+                    self.received(event_loop, fetch, &*value);
+                }
             }
             WindowEvent::RedrawRequested => {
                 let (Some(gfx), Some(ui)) = (&mut self.gfx, &mut self.ui) else {
@@ -267,7 +501,7 @@ impl<A: App> ApplicationHandler<A::Event> for Runner<A> {
                     // Out of date: the next draw rebuilds the swapchain.
                     Ok(false) => {
                         if let Some(window) = &self.window
-                            && window.inner_size().width > 0
+                            && window.surface_size().width > 0
                         {
                             window.request_redraw();
                         }
@@ -276,7 +510,14 @@ impl<A: App> ApplicationHandler<A::Event> for Runner<A> {
                 }
             }
             event => {
-                if self.ui.as_mut().is_some_and(|ui| ui.event(&event)) {
+                let Some(ui) = &mut self.ui else { return };
+                let changed = ui.event(&event);
+                let paste = std::mem::take(&mut ui.paste_key);
+                let field = ui.focus.is_some();
+                if paste {
+                    self.paste(event_loop, field);
+                }
+                if changed {
                     self.rebuild(false, event_loop);
                 }
             }

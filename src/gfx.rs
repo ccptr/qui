@@ -89,11 +89,11 @@ fn err(what: &str) -> impl Fn(vk::Result) -> String + '_ {
 }
 
 impl Gfx {
-    pub fn new(window: &Window) -> Result<Gfx, String> {
+    pub fn new(window: &dyn Window) -> Result<Gfx, String> {
         unsafe { Self::create(window) }
     }
 
-    unsafe fn create(window: &Window) -> Result<Gfx, String> {
+    unsafe fn create(window: &dyn Window) -> Result<Gfx, String> {
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| format!("Vulkan is not available ({e})"))?;
         let display = window
@@ -412,7 +412,7 @@ impl Gfx {
             });
         }
 
-        let size = window.inner_size();
+        let size = window.surface_size();
         let mut gfx = Gfx {
             _entry: entry,
             instance,
@@ -1135,7 +1135,7 @@ unsafe fn create_surface(
     instance: &ash::Instance,
     display: RawDisplayHandle,
     window: RawWindowHandle,
-    _winit: &Window,
+    _winit: &dyn Window,
 ) -> Result<vk::SurfaceKHR, String> {
     let result = unsafe {
         match (display, window) {

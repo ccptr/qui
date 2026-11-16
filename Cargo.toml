@@ -11,4 +11,4 @@ license.workspace = true
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
 # No client-side-decoration feature: it would pull in a second font
 # rasterizer and a 2D renderer just for the title bar on GNOME.
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+winit = { version = "=0.31.0-beta.4", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }

@@ -647,6 +647,41 @@ impl Gfx {
         }
     }
 
+    /// Creates the swapchain now if it is due (normally the next draw
+    /// does), without presenting anything.
+    pub fn ensure_swapchain(&mut self) -> Result<(), String> {
+        if self.stale && self.rebuild()? {
+            self.warm()?;
+        }
+        Ok(())
+    }
+
+    /// Submits an empty command buffer and waits for it. A driver may
+    /// set up a new swapchain's memory on its first submit (several
+    /// milliseconds for full-window images); this does it ahead of the
+    /// first frame.
+    fn warm(&mut self) -> Result<(), String> {
+        let d = self.device.clone();
+        let fi = self.frame;
+        let (cmd, fence) = (self.frames[fi].cmd, self.frames[fi].fence);
+        unsafe {
+            d.wait_for_fences(&[fence], true, u64::MAX).map_err(err("wait"))?;
+            d.reset_fences(&[fence]).map_err(err("reset fence"))?;
+            d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).map_err(err("reset cmd"))?;
+            d.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(err("begin"))?;
+            d.end_command_buffer(cmd).map_err(err("end"))?;
+            let cmds = [cmd];
+            d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence)
+                .map_err(err("vkQueueSubmit"))?;
+            d.wait_for_fences(&[fence], true, u64::MAX).map_err(err("wait"))?;
+        }
+        Ok(())
+    }
+
     /// Whether the current swapchain presents with MAILBOX.
     pub fn is_mailbox(&self) -> bool {
         self.swapchain != vk::SwapchainKHR::null() && !self.stale && self.present_mode == vk::PresentModeKHR::MAILBOX

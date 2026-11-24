@@ -8,15 +8,25 @@
 //! Vulkan device, the glyph and image atlases and the app's state live on,
 //! so showing again is quick.
 //!
+//! A layer surface's scale comes from the compositor, which tells the
+//! layer surface itself (not its subsurface) as soon as it has an output:
+//! before the first configure. So nothing is drawn before the configure:
+//! it is acknowledged, the frame is drawn at the scale just learned, and
+//! only then is the catch-all surface committed, which maps both at once.
+//!
 //! A layer surface with [`Spec::keep_when_hidden`] is instead *parked* when
 //! hidden: the catch-all surface loses its buffer and its layer role, so
-//! nothing is mapped, but the content surface and its swapchain stay. To
-//! show it again, the first frame is drawn into the parked content right
-//! away and the layer role is given back; the compositor maps both with
-//! its configure, a round trip later. [`Cx::prepare`] creates a parked
-//! surface up front, so even the first show is instant. Parked surfaces
-//! present with MAILBOX (a FIFO present may wait for a frame callback an
-//! unmapped surface never gets); without it, hiding destroys as usual.
+//! nothing is mapped, but the content surface and its swapchain stay.
+//! Showing it gives the role back and draws when the configure comes, a
+//! round trip later, with no surfaces or swapchain to create.
+//! [`Cx::prepare`] creates a parked surface up front: it takes the layer
+//! role just long enough for the configure (and the scale), never maps,
+//! and creates the swapchain without presenting. The frame drawn for a
+//! show is presented just before the catch-all surface's commit maps it,
+//! so parked surfaces present with MAILBOX: under FIFO the driver may
+//! first wait for the callback of the previous frame, and if that frame
+//! never reached the screen before hiding, the callback only comes once
+//! mapped. Without MAILBOX, hiding destroys the surface as usual.
 //!
 //! A layer surface is two Wayland surfaces: a transparent one covering the
 //! anchored area (a single-pixel buffer stretched by the viewporter, so it
@@ -172,9 +182,10 @@ pub struct Cx {
     /// GPU copies, so a hidden app holds no GPU memory. Showing again then
     /// creates the device anew (tens of milliseconds).
     pub release_gpu: bool,
-    /// Create the surface parked (hidden, its swapchain ready), so a later
-    /// [`Cx::show`] of the same kind is instant. Needs a layer-shell spec
-    /// with [`Spec::keep_when_hidden`]; ignored while a surface exists.
+    /// Create the surface parked (hidden, its swapchain ready at the right
+    /// scale), so a later [`Cx::show`] of the same kind is instant. Needs a
+    /// layer-shell spec with [`Spec::keep_when_hidden`]; ignored while a
+    /// surface exists.
     pub prepare: Option<Spec>,
     pub exit: bool,
     /// Build once more (state changed during the build).
@@ -185,11 +196,17 @@ pub struct Cx {
     /// Ctrl+V does outside a text field).
     pub paste: bool,
     visible: bool,
+    scale: f32,
 }
 
 impl Cx {
     pub fn visible(&self) -> bool {
         self.visible
+    }
+
+    /// The surface's scale (parked ones too), or 1 without a surface.
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 }
 
@@ -197,8 +214,7 @@ pub trait App: 'static {
     /// Called once before the loop starts (e.g. to show the surface).
     fn start(&mut self, _cx: &mut Cx) {}
 
-    /// Builds the whole UI for this frame: while shown, and once when a
-    /// surface is prepared ([`Cx::visible`] is then false).
+    /// Builds the whole UI for this frame (only while shown).
     fn build(&mut self, ui: &mut Ui, cx: &mut Cx);
 
     /// The [`Waker`] was woken (coalesced). Return whether to rebuild.
@@ -330,10 +346,6 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
         if runner.process(&mut state)? {
             return Ok(());
         }
-        if state.frame_now {
-            // A parked surface is being shown or prepared: draw now.
-            continue;
-        }
         conn.flush().map_err(|e| e.to_string())?;
         let Some(guard) = queue.prepare_read() else { continue };
         let wl_fd = guard.connection_fd().as_raw_fd();
@@ -414,8 +426,9 @@ impl<A: App> Runner<A> {
     /// Handles what dispatching produced. Returns true to exit.
     fn process(&mut self, state: &mut State) -> Result<bool, String> {
         let mut rebuild = false;
-        let mut force = std::mem::take(&mut state.frame_now);
-        let mut cx = Cx { visible: state.visible(), ..Cx::default() };
+        let mut force = false;
+        let scale = state.surface.as_ref().map_or(1.0, Surface::scale);
+        let mut cx = Cx { visible: state.visible(), scale, ..Cx::default() };
 
         let fetched = std::mem::take(&mut *state.fetched.lock().unwrap());
         for f in fetched {
@@ -492,6 +505,10 @@ impl<A: App> Runner<A> {
             }
             if let Some(gfx) = &mut self.gfx {
                 gfx.set_mailbox(s.spec.keep_when_hidden && matches!(s.role, Role::Layer { .. }));
+                if s.parked {
+                    // Prepared: the swapchain now, the first frame on show.
+                    gfx.ensure_swapchain()?;
+                }
             }
             s.fresh = false;
             stat(format_args!("swapchain attached"));
@@ -500,14 +517,23 @@ impl<A: App> Runner<A> {
             }
             force = true;
         }
-        // A parked surface is drawn only when about to be shown (or
-        // prepared), never for changes while hidden.
-        let parked = state.surface.as_ref().is_some_and(|s| s.parked);
-        if (force || (!parked && (rebuild || cx.again))) && self.build(state, &mut cx, force) {
-            self.dirty = true;
+        // A configure to answer: draw (if it needs a frame), then commit the
+        // catch-all surface.
+        let map = state.surface.as_ref().is_some_and(|s| s.map_pending);
+        if let Some(s) = &mut state.surface {
+            force |= std::mem::take(&mut s.draw_pending);
         }
-        if self.dirty && (force || !parked) {
+        // A parked surface is never drawn.
+        let parked = state.surface.as_ref().is_some_and(|s| s.parked);
+        if !parked && (force || rebuild || cx.again) && self.build(state, &mut cx, force) {
+            self.dirty = true;
+            stat(format_args!("built"));
+        }
+        if self.dirty && !parked {
             self.draw(state)?;
+        }
+        if map {
+            state.commit_base();
         }
         self.apply(state, cx)
     }
@@ -677,9 +703,23 @@ struct Surface {
     fresh: bool,
     /// Hidden, kept for the next show (see the module docs).
     parked: bool,
+    /// Prepared, waiting for the first configure before parking.
+    probing: bool,
+    /// Configured: commit the catch-all surface (after the next draw).
+    map_pending: bool,
+    /// The configure needs a frame first (mapping, or a new area).
+    draw_pending: bool,
 }
 
 impl Surface {
+    /// The surface the compositor tells the scale.
+    fn scale_surface(&self) -> &wl_surface::WlSurface {
+        match &self.role {
+            Role::Layer { base, .. } => base,
+            Role::Toplevel { .. } => &self.content,
+        }
+    }
+
     fn scale(&self) -> f32 {
         if self.scale120 > 0 { self.scale120 as f32 / 120.0 } else { self.int_scale.max(1) as f32 }
     }
@@ -723,9 +763,6 @@ struct State {
     /// The last scale an output gave (`scale120`, `int_scale`): a new
     /// surface starts with it, so it rarely renders at the wrong scale.
     last_scale: (u32, i32),
-    /// Build and draw before waiting for events (a parked surface is
-    /// being shown or prepared).
-    frame_now: bool,
     xkb_ctx: *mut xkb::xkb_context,
     xkb: Option<Xkb>,
     repeat: (i32, i32),
@@ -813,7 +850,6 @@ impl State {
             data_device,
             surface: None,
             last_scale: (0, 1),
-            frame_now: false,
             xkb_ctx,
             xkb: None,
             repeat: (25, 600),
@@ -888,31 +924,22 @@ impl State {
             }
             self.destroy_surface();
         }
-        self.create_surface(spec, qh, true)
+        self.create_surface(spec, qh, false)
     }
 
-    /// Creates a parked surface with its swapchain (drawn once), if `spec`
-    /// is a layer surface and the compositor has layer-shell.
+    /// Creates a parked layer surface: it takes the layer role until the
+    /// configure (which tells the scale), and gets its swapchain then.
     fn prepare(&mut self, spec: Spec, qh: &QueueHandle<State>) {
-        if spec.layer_shell
-            && self.layer_shell.is_some()
-            && self.subcompositor.is_some()
-            && self.viewporter.is_some()
-            && self.create_surface(spec, qh, false).is_ok()
-        {
-            self.frame_now = true;
+        if spec.layer_shell && self.layer_shell.is_some() && self.subcompositor.is_some() {
+            let _ = self.create_surface(spec, qh, true);
         }
     }
 
-    /// Creates the surfaces; without `with_role`, a parked layer surface (sized
-    /// by the spec, as there is no configure).
-    fn create_surface(&mut self, spec: Spec, qh: &QueueHandle<State>, with_role: bool) -> Result<(), String> {
+    /// Creates the surfaces. With `probe` (layer surfaces only), the
+    /// surface is parked once its first configure arrives.
+    fn create_surface(&mut self, spec: Spec, qh: &QueueHandle<State>, probe: bool) -> Result<(), String> {
         let content = self.compositor.create_surface(qh, ());
         let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&content, qh, ()));
-        let fractional = match (&self.fractional, &viewport) {
-            (Some(f), Some(_)) => Some(f.get_fractional_scale(&content, qh, ())),
-            _ => None,
-        };
         let use_layer = spec.layer_shell && self.layer_shell.is_some() && self.subcompositor.is_some();
         if spec.layer_shell && !use_layer {
             eprintln!("vkui: the compositor has no layer-shell; showing a normal window");
@@ -922,12 +949,9 @@ impl State {
             let subsurface = self.subcompositor.as_ref().unwrap().get_subsurface(&content, &base, qh, ());
             subsurface.set_desync();
             let base_viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&base, qh, ()));
-            let layer = with_role.then(|| {
-                let layer = new_layer(self.layer_shell.as_ref().unwrap(), &base, &spec, qh);
-                configure_layer(&layer, &spec);
-                layer
-            });
-            base.commit();
+            let layer = new_layer(self.layer_shell.as_ref().unwrap(), &base, &spec, qh);
+            configure_layer(&layer, &spec);
+            let layer = Some(layer);
             Role::Layer { layer, subsurface, base, base_viewport, buffer: None, attached: false, area: None }
         } else {
             let wm = self.wm_base.as_ref().ok_or("The compositor has neither layer-shell nor xdg-shell")?;
@@ -946,17 +970,30 @@ impl State {
                 d.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
                 d
             });
-            content.commit();
             Role::Toplevel { xdg, toplevel, decoration, pending: (0, 0) }
         };
+        // The scale is asked on the surface with the role: the compositor
+        // tells it before the first configure (a subsurface only learns it
+        // once shown). Fractional scales need the content's viewport.
+        let fractional = match (&self.fractional, &viewport, &role) {
+            (Some(f), Some(_), Role::Layer { base, .. }) => Some(f.get_fractional_scale(base, qh, ())),
+            (Some(f), Some(_), Role::Toplevel { .. }) => Some(f.get_fractional_scale(&content, qh, ())),
+            _ => None,
+        };
+        match &role {
+            Role::Layer { base, .. } => base.commit(),
+            Role::Toplevel { .. } => content.commit(),
+        }
         if let Some(vp) = &viewport {
             vp.set_destination(spec.width as i32, spec.height as i32);
         }
+        // Until the compositor says, the last scale it gave.
         let (scale120, int_scale) = self.last_scale;
+        let scale120 = if fractional.is_some() { scale120 } else { 0 };
         if viewport.is_none() && int_scale > 1 {
             content.set_buffer_scale(int_scale);
         }
-        let parked = !with_role && use_layer;
+        let parked = probe && use_layer;
         let size = (spec.width, spec.height);
         self.surface = Some(Surface {
             spec,
@@ -968,18 +1005,28 @@ impl State {
             size: parked.then_some(size),
             scale120,
             int_scale,
-            needs_attach: parked,
+            needs_attach: false,
             fresh: true,
             parked,
+            probing: parked,
+            map_pending: false,
+            draw_pending: false,
         });
         self.update_blur();
         Ok(())
     }
 
-    /// Gives a parked surface its layer role back and draws its first
-    /// frame at once; the compositor maps it with the configure.
+    /// Gives a parked surface its layer role back; its configure draws
+    /// the first frame and maps it.
     fn unpark(&mut self, spec: Spec, qh: &QueueHandle<State>) {
         let (Some(s), Some(shell)) = (&mut self.surface, &self.layer_shell) else { return };
+        if s.probing {
+            // Still being prepared: its pending configure now maps it.
+            s.probing = false;
+            s.parked = false;
+            s.spec = spec;
+            return;
+        }
         if (s.spec.width, s.spec.height) != (spec.width, spec.height) {
             s.size = Some((spec.width, spec.height));
             if let Some(vp) = &s.viewport {
@@ -995,7 +1042,6 @@ impl State {
         base.commit();
         *layer = Some(l);
         self.update_blur();
-        self.frame_now = true;
     }
 
     /// Hides a layer surface but keeps it: the catch-all surface drops its
@@ -1016,13 +1062,23 @@ impl State {
         s.parked = true;
     }
 
-    /// Centers the content in the catch-all area.
+    /// Centers the content in the catch-all area (applied with the
+    /// catch-all surface's next commit).
     fn place_content(&mut self) {
         let Some(s) = &self.surface else { return };
-        if let Role::Layer { subsurface, area: Some((aw, ah)), base, .. } = &s.role {
+        if let Role::Layer { subsurface, area: Some((aw, ah)), .. } = &s.role {
             let x = (*aw as i32 - s.spec.width as i32) / 2;
             let y = (*ah as i32 - s.spec.height as i32) / 2;
             subsurface.set_position(x.max(0), y.max(0));
+        }
+    }
+
+    /// Commits the catch-all surface after a configure (mapping it, with
+    /// the content drawn just before).
+    fn commit_base(&mut self) {
+        let Some(s) = &mut self.surface else { return };
+        s.map_pending = false;
+        if let Role::Layer { base, .. } = &s.role {
             base.commit();
         }
     }
@@ -1468,8 +1524,9 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for State {
 impl Dispatch<wl_surface::WlSurface, ()> for State {
     fn event(state: &mut Self, surface: &wl_surface::WlSurface, event: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         let wl_surface::Event::PreferredBufferScale { factor } = event else { return };
+        stat(format_args!("preferred buffer scale {factor}"));
         let Some(s) = &mut state.surface else { return };
-        if *surface != s.content || s.fractional.is_some() || s.int_scale == factor {
+        if surface != s.scale_surface() || s.fractional.is_some() || s.int_scale == factor {
             return;
         }
         let before = s.scale();
@@ -1487,6 +1544,7 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
 impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for State {
     fn event(state: &mut Self, _: &wp_fractional_scale_v1::WpFractionalScaleV1, event: wp_fractional_scale_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
         let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else { return };
+        stat(format_args!("preferred scale {}", scale as f32 / 120.0));
         let Some(s) = &mut state.surface else { return };
         if s.scale120 != scale {
             let before = s.scale();
@@ -1505,6 +1563,20 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
             zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
                 stat(format_args!("layer configured ({width}x{height})"));
                 layer.ack_configure(serial);
+                if let Some(s) = &mut state.surface
+                    && s.probing
+                {
+                    // Prepared: the configure (and the scale sent before
+                    // it) is all it was for. Park, then get the swapchain.
+                    s.probing = false;
+                    if let Role::Layer { layer, .. } = &mut s.role
+                        && let Some(l) = layer.take()
+                    {
+                        l.destroy();
+                    }
+                    s.needs_attach = true;
+                    return;
+                }
                 let buffer = match &state.surface {
                     Some(Surface { role: Role::Layer { buffer: None, .. }, .. }) => transparent_buffer(state, qh),
                     _ => None,
@@ -1514,6 +1586,11 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
                 let Role::Layer { base, base_viewport, buffer: slot, attached, area, .. } = &mut s.role else { return };
                 let aw = if width == 0 { spec_size.0 } else { width };
                 let ah = if height == 0 { spec_size.1 } else { height };
+                // Mapping, or a new area: draw before committing. A repeated
+                // configure only needs its commit.
+                if !*attached || *area != Some((aw, ah)) {
+                    s.draw_pending = true;
+                }
                 *area = Some((aw, ah));
                 if let Some(b) = buffer {
                     *slot = Some(b);
@@ -1530,6 +1607,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for State {
                     s.size = Some(spec_size);
                     s.needs_attach = true;
                 }
+                s.map_pending = true;
                 state.place_content();
             }
             zwlr_layer_surface_v1::Event::Closed => state.closed = true,

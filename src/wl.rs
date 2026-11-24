@@ -153,6 +153,10 @@ pub struct Cx {
     /// Create the surface, or update it (size, layer, ...) if it exists.
     pub show: Option<Spec>,
     pub hide: bool,
+    /// With [`Cx::hide`]: also release the Vulkan device and the atlases'
+    /// GPU copies, so a hidden app holds no GPU memory. Showing again then
+    /// creates the device anew (tens of milliseconds).
+    pub release_gpu: bool,
     pub exit: bool,
     /// Build once more (state changed during the build).
     pub again: bool,
@@ -293,6 +297,7 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
         trace: std::env::var_os("VKUI_EVENTS").is_some() || std::env::var_os("RLS_EVENTS").is_some(),
         started: std::time::Instant::now(),
         frames: 0,
+        shown_at: None,
     };
     let mut cx = Cx::default();
     runner.app.start(&mut cx);
@@ -364,6 +369,8 @@ struct Runner<A: App> {
     trace: bool,
     started: std::time::Instant,
     frames: u64,
+    /// When the surface was last created (for VKUI_STATS).
+    shown_at: Option<std::time::Instant>,
 }
 
 impl<A: App> Runner<A> {
@@ -503,6 +510,9 @@ impl<A: App> Runner<A> {
             self.frames += 1;
             if self.stats {
                 eprintln!("vkui: frame {} at {} ms", self.frames, self.started.elapsed().as_millis());
+                if let Some(at) = self.shown_at.take() {
+                    eprintln!("vkui: shown in {:.1} ms", at.elapsed().as_secs_f64() * 1000.0);
+                }
             }
         }
         Ok(())
@@ -523,11 +533,29 @@ impl<A: App> Runner<A> {
         }
         if cx.hide {
             self.teardown(state);
+            if cx.release_gpu {
+                self.release_gpu();
+            }
         }
         if let Some(spec) = cx.show {
+            if state.surface.is_none() {
+                self.shown_at = Some(std::time::Instant::now());
+            }
             state.show(spec, &self.qh)?;
         }
         Ok(false)
+    }
+
+    /// Drops the Vulkan device. The glyph atlas is uploaded whole to the
+    /// next one; images are decoded again by the app as it draws them.
+    fn release_gpu(&mut self) {
+        self.gfx = None;
+        if let Some(ui) = &mut self.ui {
+            ui.text.dirty = Some([0, 0, crate::text::ATLAS, crate::text::ATLAS]);
+            ui.images.clear();
+        }
+        // Return the driver's freed heap to the system.
+        unsafe { libc::malloc_trim(0) };
     }
 
     fn teardown(&mut self, state: &mut State) {

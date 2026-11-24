@@ -99,6 +99,9 @@ pub struct Gfx {
     frame: usize,
     /// The swapchain must be rebuilt before the next frame.
     stale: bool,
+    /// Use MAILBOX where the surface offers it (see [`Gfx::set_mailbox`]).
+    want_mailbox: bool,
+    present_mode: vk::PresentModeKHR,
     pub device_name: String,
 }
 
@@ -556,6 +559,8 @@ impl Gfx {
             frames,
             frame: 0,
             stale: true,
+            want_mailbox: false,
+            present_mode: vk::PresentModeKHR::FIFO,
             device_name,
         };
         gfx.clear_atlas()?;
@@ -624,8 +629,27 @@ impl Gfx {
 
     /// Marks the swapchain for rebuilding at the window's new size.
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.extent = vk::Extent2D { width, height };
-        self.stale = true;
+        let extent = vk::Extent2D { width, height };
+        if extent != self.extent {
+            self.extent = extent;
+            self.stale = true;
+        }
+    }
+
+    /// Prefers MAILBOX presentation (from the next swapchain on). Presents
+    /// then never wait for the compositor, which matters for a surface
+    /// drawn while unmapped: under FIFO, the driver may wait for a frame
+    /// callback that an unmapped surface never gets.
+    pub fn set_mailbox(&mut self, on: bool) {
+        if self.want_mailbox != on {
+            self.want_mailbox = on;
+            self.stale = true;
+        }
+    }
+
+    /// Whether the current swapchain presents with MAILBOX.
+    pub fn is_mailbox(&self) -> bool {
+        self.swapchain != vk::SwapchainKHR::null() && !self.stale && self.present_mode == vk::PresentModeKHR::MAILBOX
     }
 
     fn rebuild(&mut self) -> Result<bool, String> {
@@ -683,6 +707,17 @@ impl Gfx {
             .into_iter()
         .find(|a| caps.supported_composite_alpha.contains(*a))
         .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
+        let mailbox = self.want_mailbox
+            && unsafe { self.surface_fn.get_physical_device_surface_present_modes(self.pdev, self.surface) }
+                .is_ok_and(|m| m.contains(&vk::PresentModeKHR::MAILBOX));
+        let present_mode = if mailbox { vk::PresentModeKHR::MAILBOX } else { vk::PresentModeKHR::FIFO };
+        if mailbox {
+            // One image on screen, one queued, one to draw into.
+            count = count.max(3);
+            if caps.max_image_count > 0 {
+                count = count.min(caps.max_image_count);
+            }
+        }
         let old = self.swapchain;
         let swapchain = unsafe {
             self.swapchain_fn.create_swapchain(
@@ -697,9 +732,10 @@ impl Gfx {
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(caps.current_transform)
                     .composite_alpha(alpha)
-                    // FIFO: always available, never renders faster than the
-                    // display, and lets the GPU idle in between.
-                    .present_mode(vk::PresentModeKHR::FIFO)
+                    // FIFO (unless MAILBOX is wanted): always available,
+                    // never renders faster than the display, and lets the
+                    // GPU idle in between.
+                    .present_mode(present_mode)
                     .clipped(true)
                     .old_swapchain(old),
                 None,
@@ -712,6 +748,7 @@ impl Gfx {
         }
         self.swapchain = swapchain;
         self.extent = extent;
+        self.present_mode = present_mode;
 
         let d = &self.device;
         let images = unsafe { self.swapchain_fn.get_swapchain_images(swapchain) }

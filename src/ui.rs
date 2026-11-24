@@ -279,7 +279,7 @@ impl Ui {
                 true
             }
             Event::Key(key) => {
-                if is_paste(key, self.ctrl(), self.modifiers.shift) {
+                if is_paste(key, key.mods.ctrl || key.mods.logo, key.mods.shift) {
                     self.paste_key = true;
                     return false;
                 }
@@ -789,13 +789,13 @@ impl Ui {
                 let rest2 = &rest[skip..];
                 i + skip + rest2.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest2.len())
             };
-            let ctrl = self.ctrl();
-            let alt = self.modifiers.alt;
             for i in 0..self.keys.len() {
                 if self.keys[i].1 {
                     continue;
                 }
                 let key = self.keys[i].0.clone();
+                let ctrl = key.mods.ctrl || key.mods.logo;
+                let alt = key.mods.alt;
                 let mut used = true;
                 match key.key {
                     Key::Named(Named::Backspace) if cursor > 0 => {
@@ -835,7 +835,7 @@ impl Ui {
                         edit = Edit::Changed;
                     }
                     _ => match &key.text {
-                        Some(text) if !ctrl && !self.modifiers.logo => {
+                        Some(text) if !ctrl => {
                             let text: String = text.chars().filter(|c| !c.is_control()).collect();
                             if text.is_empty() {
                                 used = false;

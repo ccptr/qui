@@ -1,5 +1,5 @@
-//! Input events in vkui's own types, so [`crate::Ui`] works the same under
-//! every runner (winit, or the native Wayland one in [`crate::wl`]).
+//! Input events as [`crate::Ui`] receives them from the windowing
+//! ([`crate::wl`]).
 
 /// Keyboard modifiers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -61,6 +61,9 @@ pub struct KeyEvent {
     /// The Linux evdev scan code (0 if unknown).
     pub code: u32,
     pub repeat: bool,
+    /// Modifiers held when the key was pressed (they may have changed by
+    /// the time the frame is built).
+    pub mods: Mods,
 }
 
 /// evdev code of the V key (where V is on a US keyboard).

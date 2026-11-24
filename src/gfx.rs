@@ -13,8 +13,7 @@
 use crate::image::{IMAGE_ATLAS, Images};
 use crate::text::{ATLAS, Text};
 use ash::vk;
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use std::ffi::{CStr, c_char};
+use std::ffi::c_char;
 
 const FRAMES: usize = 2;
 
@@ -108,15 +107,6 @@ fn err(what: &str) -> impl Fn(vk::Result) -> String + '_ {
 }
 
 impl Gfx {
-    #[cfg(feature = "winit")]
-    pub fn new(window: &dyn winit::window::Window) -> Result<Gfx, String> {
-        use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-        let display = window.display_handle().map_err(|e| e.to_string())?.as_raw();
-        let handle = window.window_handle().map_err(|e| e.to_string())?.as_raw();
-        let size = window.surface_size();
-        unsafe { Self::create(display, handle, (size.width, size.height), false, window.scale_factor()) }
-    }
-
     /// Renders into a Wayland surface. With `transparent`, the swapchain
     /// uses premultiplied alpha, so what isn't drawn shows what's below.
     ///
@@ -129,8 +119,10 @@ impl Gfx {
         size: (u32, u32),
         transparent: bool,
     ) -> Result<Gfx, String> {
-        let (display, handle) = wayland_handles(display, surface)?;
-        unsafe { Self::create(display, handle, size, transparent, 1.0) }
+        if display.is_null() || surface.is_null() {
+            return Err("null Wayland handle".into());
+        }
+        unsafe { Self::create(display, surface, size, transparent) }
     }
 
     /// Destroys the swapchain and the Vulkan surface, keeping the device.
@@ -161,8 +153,7 @@ impl Gfx {
         size: (u32, u32),
     ) -> Result<(), String> {
         self.detach();
-        let (display, handle) = wayland_handles(display, surface)?;
-        let surface = unsafe { create_surface(&self._entry, &self.instance, display, handle, 1.0) }?;
+        let surface = unsafe { create_surface(&self._entry, &self.instance, display, surface) }?;
         let ok = unsafe { self.surface_fn.get_physical_device_surface_support(self.pdev, self.family, surface) }
             .unwrap_or(false);
         if !ok {
@@ -176,44 +167,23 @@ impl Gfx {
     }
 
     unsafe fn create(
-        display: RawDisplayHandle,
-        handle: RawWindowHandle,
+        display: *mut std::ffi::c_void,
+        wl_surface: *mut std::ffi::c_void,
         size: (u32, u32),
         transparent: bool,
-        scale: f64,
     ) -> Result<Gfx, String> {
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| format!("Vulkan is not available ({e})"))?;
 
-        let mut extensions: Vec<*const c_char> = vec![ash::khr::surface::NAME.as_ptr()];
-        extensions.push(match (display, handle) {
-            (RawDisplayHandle::Wayland(_), _) => ash::khr::wayland_surface::NAME.as_ptr(),
-            (RawDisplayHandle::Xlib(_), _) => ash::khr::xlib_surface::NAME.as_ptr(),
-            (RawDisplayHandle::Xcb(_), _) => ash::khr::xcb_surface::NAME.as_ptr(),
-            (_, RawWindowHandle::Win32(_)) => ash::khr::win32_surface::NAME.as_ptr(),
-            (_, RawWindowHandle::AppKit(_)) => ash::ext::metal_surface::NAME.as_ptr(),
-            other => return Err(format!("Unsupported window system: {other:?}")),
-        });
-        let available: Vec<vk::ExtensionProperties> =
-            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-        let has = |name: &CStr| {
-            available
-                .iter()
-                .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == name))
-        };
-        // MoltenVK is a "portability" implementation and is only listed
-        // when asked for.
-        let mut flags = vk::InstanceCreateFlags::empty();
-        if has(ash::khr::portability_enumeration::NAME) {
-            extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
-            flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-        }
+        let extensions: Vec<*const c_char> =
+            vec![ash::khr::surface::NAME.as_ptr(), ash::khr::wayland_surface::NAME.as_ptr()];
+        let flags = vk::InstanceCreateFlags::empty();
         let mut layers: Vec<*const c_char> = Vec::new();
         if std::env::var_os("RLS_VK_VALIDATE").is_some() {
             layers.push(c"VK_LAYER_KHRONOS_validation".as_ptr());
         }
         let app = vk::ApplicationInfo::default()
-            .application_name(c"rlocalsend")
+            .application_name(c"vkui")
             .api_version(vk::API_VERSION_1_0);
         let instance = unsafe {
             entry.create_instance(
@@ -227,7 +197,7 @@ impl Gfx {
         }
         .map_err(err("vkCreateInstance"))?;
 
-        let surface = unsafe { create_surface(&entry, &instance, display, handle, scale) }?;
+        let surface = unsafe { create_surface(&entry, &instance, display, wl_surface) }?;
         let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
 
         // Prefer the integrated GPU: a few hundred quads never need more,
@@ -265,16 +235,7 @@ impl Gfx {
             .unwrap_or_default();
         let memory_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
 
-        let device_exts: Vec<vk::ExtensionProperties> =
-            unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
-        let mut dev_extensions = vec![ash::khr::swapchain::NAME.as_ptr()];
-        let portability = c"VK_KHR_portability_subset";
-        if device_exts
-            .iter()
-            .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == portability))
-        {
-            dev_extensions.push(portability.as_ptr());
-        }
+        let dev_extensions = [ash::khr::swapchain::NAME.as_ptr()];
         let priorities = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
@@ -1369,112 +1330,18 @@ fn create_pipeline(
     Ok((layout, pipeline))
 }
 
-/// Creates the `VkSurfaceKHR` for the window's native handle.
+/// Creates the `VkSurfaceKHR` for a `wl_surface`.
 unsafe fn create_surface(
     entry: &ash::Entry,
     instance: &ash::Instance,
-    display: RawDisplayHandle,
-    window: RawWindowHandle,
-    _scale: f64,
-) -> Result<vk::SurfaceKHR, String> {
-    let result = unsafe {
-        match (display, window) {
-            (RawDisplayHandle::Wayland(d), RawWindowHandle::Wayland(w)) => {
-                ash::khr::wayland_surface::Instance::new(entry, instance).create_wayland_surface(
-                    &vk::WaylandSurfaceCreateInfoKHR::default()
-                        .display(d.display.as_ptr())
-                        .surface(w.surface.as_ptr()),
-                    None,
-                )
-            }
-            (RawDisplayHandle::Xlib(d), RawWindowHandle::Xlib(w)) => {
-                let dpy = d.display.ok_or("Xlib display handle is null")?;
-                ash::khr::xlib_surface::Instance::new(entry, instance).create_xlib_surface(
-                    &vk::XlibSurfaceCreateInfoKHR::default()
-                        .dpy(dpy.as_ptr().cast())
-                        .window(w.window),
-                    None,
-                )
-            }
-            (RawDisplayHandle::Xcb(d), RawWindowHandle::Xcb(w)) => {
-                let connection = d.connection.ok_or("XCB connection handle is null")?;
-                ash::khr::xcb_surface::Instance::new(entry, instance).create_xcb_surface(
-                    &vk::XcbSurfaceCreateInfoKHR::default()
-                        .connection(connection.as_ptr())
-                        .window(w.window.get()),
-                    None,
-                )
-            }
-            (_, RawWindowHandle::Win32(w)) => {
-                ash::khr::win32_surface::Instance::new(entry, instance).create_win32_surface(
-                    &vk::Win32SurfaceCreateInfoKHR::default()
-                        .hinstance(w.hinstance.map_or(0, |h| h.get()))
-                        .hwnd(w.hwnd.get()),
-                    None,
-                )
-            }
-            #[cfg(target_os = "macos")]
-            (_, RawWindowHandle::AppKit(w)) => {
-                let layer = macos::metal_layer(w.ns_view.as_ptr(), _scale);
-                ash::ext::metal_surface::Instance::new(entry, instance).create_metal_surface(
-                    &vk::MetalSurfaceCreateInfoEXT::default().layer(layer.cast()),
-                    None,
-                )
-            }
-            other => return Err(format!("Unsupported window system: {other:?}")),
-        }
-    };
-    result.map_err(err("vkCreate*SurfaceKHR"))
-}
-
-fn wayland_handles(
     display: *mut std::ffi::c_void,
     surface: *mut std::ffi::c_void,
-) -> Result<(RawDisplayHandle, RawWindowHandle), String> {
-    use raw_window_handle::{WaylandDisplayHandle, WaylandWindowHandle};
-    use std::ptr::NonNull;
-    let display = NonNull::new(display).ok_or("null wl_display")?;
-    let surface = NonNull::new(surface).ok_or("null wl_surface")?;
-    Ok((
-        RawDisplayHandle::Wayland(WaylandDisplayHandle::new(display)),
-        RawWindowHandle::Wayland(WaylandWindowHandle::new(surface)),
-    ))
-}
-
-/// A `CAMetalLayer` for an `NSView`, through the Objective-C runtime (what
-/// `raw-window-metal` does, without the crate).
-#[cfg(target_os = "macos")]
-mod macos {
-    use std::ffi::{c_char, c_void};
-
-    #[link(name = "objc")]
-    unsafe extern "C" {
-        fn objc_getClass(name: *const c_char) -> *mut c_void;
-        fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend();
+) -> Result<vk::SurfaceKHR, String> {
+    unsafe {
+        ash::khr::wayland_surface::Instance::new(entry, instance).create_wayland_surface(
+            &vk::WaylandSurfaceCreateInfoKHR::default().display(display.cast()).surface(surface.cast()),
+            None,
+        )
     }
-    #[link(name = "QuartzCore", kind = "framework")]
-    unsafe extern "C" {}
-
-    pub unsafe fn metal_layer(view: *mut c_void, scale: f64) -> *mut c_void {
-        unsafe {
-            let send0: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
-                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_ptr: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
-                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_bool: unsafe extern "C" fn(*mut c_void, *mut c_void, bool) =
-                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let send_f64: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) =
-                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-            let sel = |name: &std::ffi::CStr| sel_registerName(name.as_ptr());
-
-            let class = objc_getClass(c"CAMetalLayer".as_ptr());
-            // +[CAMetalLayer layer] is autoreleased; the view retains it.
-            let layer = send0(class, sel(c"layer"));
-            send_f64(layer, sel(c"setContentsScale:"), scale);
-            send_bool(view, sel(c"setWantsLayer:"), true);
-            send_ptr(view, sel(c"setLayer:"), layer);
-            layer
-        }
-    }
+    .map_err(err("vkCreateWaylandSurfaceKHR"))
 }

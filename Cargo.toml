@@ -1,6 +1,6 @@
 [package]
 name = "vkui"
-description = "A minimal immediate-mode GUI toolkit on Vulkan (ash), for winit windows or native Wayland layer-shell surfaces, with its own TrueType rasterizer"
+description = "A minimal immediate-mode GUI toolkit on Vulkan (ash) and native Wayland (windows and layer-shell surfaces), with its own TrueType rasterizer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,34 +9,21 @@ license.workspace = true
 # `loaded`: libvulkan is opened at runtime, so the binary starts (and can
 # report the problem) on machines without Vulkan.
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
-# No client-side-decoration feature: it would pull in a second font
-# rasterizer and a 2D renderer just for the title bar on GNOME.
-winit = { version = "=0.31.0-beta.4", default-features = false, features = ["x11", "wayland", "wayland-dlopen"], optional = true }
-raw-window-handle = "0.6"
 # PNG decoding for colour emoji (CBDT) and for apps' icons.
 png = { version = "0.18", optional = true }
-
-[target.'cfg(unix)'.dependencies]
 memmap2 = "0.9"
-
-# The native Wayland runner (`wl`): layer-shell surfaces, which winit can't
-# make. libwayland and libxkbcommon are opened at runtime.
-wayland-client = { version = "0.31", optional = true }
-wayland-backend = { version = "0.3", features = ["client_system", "dlopen"], optional = true }
-wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"], optional = true }
-wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
-xkbcommon-dl = { version = "0.4", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
+# The windowing is a native Wayland client; libwayland and libxkbcommon
+# are opened at runtime.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon-dl = "0.4"
 
 [features]
-default = ["winit"]
-winit = ["dep:winit"]
 png = ["dep:png"]
-wayland = [
-    "dep:wayland-client",
-    "dep:wayland-backend",
-    "dep:wayland-protocols",
-    "dep:wayland-protocols-wlr",
-    "dep:xkbcommon-dl",
-    "dep:libc",
-]
+
+[[example]]
+name = "layer"
+required-features = ["png"]

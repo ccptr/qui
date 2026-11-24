@@ -8,11 +8,48 @@
 //!
 //! CFF-flavoured OpenType (`OTTO`) is not supported; [`Font::parse`] rejects
 //! it so a caller can fall back to another file.
+//!
+//! Colour bitmap fonts (`CBLC`/`CBDT`, e.g. Noto Color Emoji) are read too:
+//! [`Font::color_bitmap`] returns a glyph's PNG, which the caller decodes.
 
 use std::collections::HashMap;
+use std::ops::Deref;
+
+/// A font file's bytes: read into memory, or mapped (fallback fonts are
+/// large and only a few of their pages are ever touched).
+pub enum FontData {
+    Owned(Vec<u8>),
+    #[cfg(unix)]
+    Mapped(memmap2::Mmap),
+}
+
+impl Deref for FontData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            FontData::Owned(v) => v,
+            #[cfg(unix)]
+            FontData::Mapped(m) => m,
+        }
+    }
+}
+
+/// A colour glyph's embedded image, with its metrics at `ppem`.
+pub struct ColorBitmap<'a> {
+    pub png: &'a [u8],
+    pub ppem: f32,
+    pub width: u32,
+    pub height: u32,
+    pub bearing_x: f32,
+    pub bearing_y: f32,
+}
 
 pub struct Font {
-    data: Vec<u8>,
+    data: FontData,
+    /// Offsets of CBLC and CBDT (colour bitmaps).
+    color: Option<(usize, usize)>,
+    /// The font has `glyf` outlines.
+    outlines: bool,
     /// Offset of the font inside `data` (non-zero in collections).
     glyf: usize,
     loca: usize,
@@ -60,6 +97,31 @@ fn u32_at(d: &[u8], o: usize) -> Option<u32> {
 impl Font {
     /// Parses a `.ttf` or the first font of a `.ttc`.
     pub fn parse(data: Vec<u8>) -> Option<Font> {
+        Self::from_data(FontData::Owned(data))
+    }
+
+    /// Opens a font file, mapped into memory on Unix.
+    pub fn open(path: &std::path::Path) -> Option<Font> {
+        #[cfg(unix)]
+        {
+            let file = std::fs::File::open(path).ok()?;
+            // SAFETY: font files aren't modified while in use; if one is,
+            // glyphs come out wrong, the reads stay in bounds.
+            let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+            Self::from_data(FontData::Mapped(map))
+        }
+        #[cfg(not(unix))]
+        {
+            Self::parse(std::fs::read(path).ok()?)
+        }
+    }
+
+    /// Whether glyphs of this font are colour images.
+    pub fn is_color(&self) -> bool {
+        self.color.is_some() && !self.outlines
+    }
+
+    pub fn from_data(data: FontData) -> Option<Font> {
         let d = &data;
         let mut base = 0usize;
         if d.get(0..4)? == b"ttcf" {
@@ -104,9 +166,16 @@ impl Font {
             }
         }
 
+        let color = tables.get(b"CBLC").zip(tables.get(b"CBDT")).map(|(a, b)| (*a, *b));
+        let outlines = tables.contains_key(b"glyf") && tables.contains_key(b"loca");
+        if !outlines && color.is_none() {
+            return None;
+        }
         Some(Font {
-            glyf: *tables.get(b"glyf")?,
-            loca: *tables.get(b"loca")?,
+            color,
+            outlines,
+            glyf: tables.get(b"glyf").copied().unwrap_or(0),
+            loca: tables.get(b"loca").copied().unwrap_or(0),
             hmtx: *tables.get(b"hmtx")?,
             long_loca,
             num_hmetrics: u16_at(d, hhea + 34)?,
@@ -190,6 +259,9 @@ impl Font {
     }
 
     fn glyph_range(&self, glyph: u16) -> Option<(usize, usize)> {
+        if !self.outlines {
+            return None;
+        }
         let g = glyph as usize;
         let (a, b) = if self.long_loca {
             (
@@ -326,6 +398,91 @@ impl Font {
             }
             Some(())
         }
+    }
+
+    /// A colour glyph's PNG from the strike closest to (and preferably not
+    /// below) `px` pixels per em.
+    pub fn color_bitmap(&self, glyph: u16, px: f32) -> Option<ColorBitmap<'_>> {
+        let (cblc, cbdt) = self.color?;
+        let d: &[u8] = &self.data;
+        let sizes = u32_at(d, cblc + 4)? as usize;
+        // (ppem, record offset) of the best strike that has this glyph.
+        let mut best: Option<(u8, usize)> = None;
+        for i in 0..sizes.min(64) {
+            let rec = cblc + 8 + i * 48;
+            let start = u16_at(d, rec + 40)?;
+            let end = u16_at(d, rec + 42)?;
+            if glyph < start || glyph > end {
+                continue;
+            }
+            let ppem = *d.get(rec + 45)?;
+            let better = match best {
+                None => true,
+                Some((b, _)) => {
+                    let (bp, np) = (b as f32, ppem as f32);
+                    if (bp >= px) != (np >= px) { np >= px } else if np >= px { np < bp } else { np > bp }
+                }
+            };
+            if better {
+                best = Some((ppem, rec));
+            }
+        }
+        let (ppem, rec) = best?;
+        let array = cblc + u32_at(d, rec)? as usize;
+        let count = u32_at(d, rec + 8)? as usize;
+        for i in 0..count.min(4096) {
+            let entry = array + i * 8;
+            let first = u16_at(d, entry)?;
+            let last = u16_at(d, entry + 2)?;
+            if glyph < first || glyph > last {
+                continue;
+            }
+            let sub = array + u32_at(d, entry + 4)? as usize;
+            let index_format = u16_at(d, sub)?;
+            let image_format = u16_at(d, sub + 2)?;
+            let image_data = cbdt + u32_at(d, sub + 4)? as usize;
+            let k = (glyph - first) as usize;
+            // (offset of the glyph's data, big metrics from the index).
+            let (offset, index_metrics) = match index_format {
+                1 => (u32_at(d, sub + 8 + k * 4)? as usize, None),
+                3 => (u16_at(d, sub + 8 + k * 2)? as usize, None),
+                2 => (u32_at(d, sub + 8)? as usize * k, Some(sub + 12)),
+                4 => {
+                    let n = u32_at(d, sub + 8)? as usize;
+                    let pos = (0..n).find(|&j| u16_at(d, sub + 12 + j * 4) == Some(glyph))?;
+                    (u16_at(d, sub + 12 + pos * 4 + 2)? as usize, None)
+                }
+                5 => {
+                    let size = u32_at(d, sub + 8)? as usize;
+                    let n = u32_at(d, sub + 20)? as usize;
+                    let pos = (0..n).find(|&j| u16_at(d, sub + 24 + j * 2) == Some(glyph))?;
+                    (size * pos, Some(sub + 12))
+                }
+                _ => return None,
+            };
+            let at = image_data + offset;
+            // (height, width, bearing x, bearing y) and where the PNG length is.
+            let (h, w, bx, by, len_at) = match image_format {
+                17 => (*d.get(at)?, *d.get(at + 1)?, *d.get(at + 2)? as i8, *d.get(at + 3)? as i8, at + 5),
+                18 => (*d.get(at)?, *d.get(at + 1)?, *d.get(at + 2)? as i8, *d.get(at + 3)? as i8, at + 8),
+                19 => {
+                    let m = index_metrics?;
+                    (*d.get(m)?, *d.get(m + 1)?, *d.get(m + 2)? as i8, *d.get(m + 3)? as i8, at)
+                }
+                _ => return None,
+            };
+            let len = u32_at(d, len_at)? as usize;
+            let png = d.get(len_at + 4..len_at + 4 + len)?;
+            return Some(ColorBitmap {
+                png,
+                ppem: ppem as f32,
+                width: w as u32,
+                height: h as u32,
+                bearing_x: bx as f32,
+                bearing_y: by as f32,
+            });
+        }
+        None
     }
 
     /// Rasterizes a glyph at `px` pixels per em, shifted right by

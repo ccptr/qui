@@ -6,12 +6,11 @@
 //! Coordinates are logical pixels; quads are emitted in physical pixels,
 //! snapped to the pixel grid.
 
-use crate::gfx::{Batch, Quad};
+use crate::gfx::{Batch, MODE_IMAGE, MODE_SHADOW, Quad};
+use crate::image::{IMAGE_ATLAS, ImageId, Images};
 use crate::text::{ATLAS, Text};
 use std::collections::HashMap;
-use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::cursor::CursorIcon;
+use crate::input::{Button, CODE_V, Cursor, Event, Key, KeyEvent, Mods, Named};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -162,21 +161,9 @@ pub enum Edit {
     Submit,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum KeyPress {
-    Back,
-    Delete,
-    Left,
-    Right,
-    Home,
-    End,
-    Enter,
-    Escape,
-    Tab,
-}
-
 pub struct Ui {
     pub text: Text,
+    pub images: Images,
     pub theme: Theme,
     pub scale: f32,
     /// Window size in logical pixels.
@@ -193,8 +180,10 @@ pub struct Ui {
     pressed: bool,
     released: bool,
     wheel: f32,
-    modifiers: ModifiersState,
-    keys: Vec<KeyPress>,
+    modifiers: Mods,
+    /// This frame's key presses; `true` once consumed by the app or a widget.
+    keys: Vec<(KeyEvent, bool)>,
+    /// Text committed by an input method this frame.
     typed: String,
     /// Clipboard text for the focused field, delivered by [`Ui::paste`].
     pasted: String,
@@ -206,7 +195,7 @@ pub struct Ui {
     focus_seen: bool,
     /// Input is ignored while building layers below a modal.
     pub blocked: bool,
-    pub cursor: CursorIcon,
+    pub cursor: Cursor,
     /// Per scroll area: (offset, largest offset as of the last frame).
     scroll: HashMap<Id, (f32, f32)>,
     cursors: HashMap<Id, usize>,
@@ -218,6 +207,7 @@ impl Ui {
     pub fn new(theme: Theme) -> Result<Ui, String> {
         Ok(Ui {
             text: Text::new()?,
+            images: Images::default(),
             theme,
             scale: 1.0,
             width: 1.0,
@@ -231,7 +221,7 @@ impl Ui {
             pressed: false,
             released: false,
             wheel: 0.0,
-            modifiers: ModifiersState::empty(),
+            modifiers: Mods::NONE,
             keys: Vec::new(),
             typed: String::new(),
             pasted: String::new(),
@@ -240,87 +230,96 @@ impl Ui {
             focus: None,
             focus_seen: false,
             blocked: false,
-            cursor: CursorIcon::Default,
+            cursor: Cursor::Default,
             scroll: HashMap::new(),
             cursors: HashMap::new(),
             outside: true,
         })
     }
 
-    /// Feeds a window event. Returns whether the UI must be rebuilt.
-    pub fn event(&mut self, event: &WindowEvent) -> bool {
+    /// Feeds an input event. Returns whether the UI must be rebuilt.
+    pub fn event(&mut self, event: &Event) -> bool {
         match event {
-            WindowEvent::PointerMoved { position, primary: true, .. } => {
-                self.mouse = (position.x as f32 / self.scale, position.y as f32 / self.scale);
+            Event::PointerMoved(x, y) => {
+                self.mouse = (x / self.scale, y / self.scale);
                 self.outside = false;
                 true
             }
-            WindowEvent::PointerLeft { primary: true, .. } => {
+            Event::PointerLeft => {
                 self.outside = true;
                 self.mouse = (-1.0, -1.0);
                 true
             }
-            WindowEvent::PointerButton { state, button, primary: true, .. }
-                if button.clone().mouse_button() == Some(MouseButton::Left) =>
-            {
-                match state {
-                    ElementState::Pressed => {
-                        self.mouse_down = true;
-                        self.pressed = true;
-                        self.press_at = Some(self.mouse);
-                    }
-                    ElementState::Released => {
-                        self.mouse_down = false;
-                        self.released = true;
-                    }
+            Event::Button { button: Button::Left, pressed } => {
+                if *pressed {
+                    self.mouse_down = true;
+                    self.pressed = true;
+                    self.press_at = Some(self.mouse);
+                } else {
+                    self.mouse_down = false;
+                    self.released = true;
                 }
                 true
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                self.wheel += match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 48.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / self.scale,
-                    _ => return false,
-                };
+            Event::Button { .. } => false,
+            Event::WheelLines(y) => {
+                self.wheel += y * 48.0;
                 true
             }
-            WindowEvent::ModifiersChanged(m) => {
-                self.modifiers = m.state();
+            Event::WheelPixels(y) => {
+                self.wheel += y / self.scale;
+                true
+            }
+            Event::Modifiers(m) => {
+                self.modifiers = *m;
                 false
             }
-            WindowEvent::Ime(Ime::Commit(text)) => {
+            Event::Commit(text) => {
                 self.typed.push_str(text);
                 true
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if is_paste(event, self.ctrl(), self.modifiers.shift_key()) {
+            Event::Key(key) => {
+                if is_paste(key, self.ctrl(), self.modifiers.shift) {
                     self.paste_key = true;
                     return false;
                 }
-                let key = match &event.logical_key {
-                    Key::Named(NamedKey::Backspace) => Some(KeyPress::Back),
-                    Key::Named(NamedKey::Delete) => Some(KeyPress::Delete),
-                    Key::Named(NamedKey::ArrowLeft) => Some(KeyPress::Left),
-                    Key::Named(NamedKey::ArrowRight) => Some(KeyPress::Right),
-                    Key::Named(NamedKey::Home) => Some(KeyPress::Home),
-                    Key::Named(NamedKey::End) => Some(KeyPress::End),
-                    Key::Named(NamedKey::Enter) => Some(KeyPress::Enter),
-                    Key::Named(NamedKey::Escape) => Some(KeyPress::Escape),
-                    Key::Named(NamedKey::Tab) => Some(KeyPress::Tab),
-                    _ => None,
-                };
-                if let Some(key) = key {
-                    self.keys.push(key);
-                } else if let Some(text) = &event.text
-                    && !self.modifiers.control_key()
-                    && !self.modifiers.meta_key()
-                {
-                    self.typed.extend(text.chars().filter(|c| !c.is_control()));
-                }
+                self.keys.push((key.clone(), false));
                 true
             }
-            _ => false,
+            Event::Focus(_) => true,
         }
+    }
+
+    /// This frame's key presses not yet consumed, with their index for
+    /// [`Ui::consume_key`]. An app checks its own bindings here before
+    /// building the widgets, which then ignore consumed keys.
+    pub fn keys(&self) -> impl Iterator<Item = (usize, &KeyEvent)> {
+        self.keys.iter().enumerate().filter(|(_, (_, used))| !used).map(|(i, (k, _))| (i, k))
+    }
+
+    pub fn consume_key(&mut self, index: usize) {
+        if let Some(k) = self.keys.get_mut(index) {
+            k.1 = true;
+        }
+    }
+
+    pub fn modifiers(&self) -> Mods {
+        self.modifiers
+    }
+
+    /// Whether the pointer is inside the window.
+    pub fn pointer_inside(&self) -> bool {
+        !self.outside
+    }
+
+    /// Whether the left button went down this frame.
+    pub fn pressed(&self) -> bool {
+        self.pressed
+    }
+
+    /// Whether the pointer moved this frame (at all, since the last frame).
+    pub fn mouse(&self) -> (f32, f32) {
+        self.mouse
     }
 
     /// Starts a frame.
@@ -331,10 +330,11 @@ impl Ui {
         self.quads.clear();
         self.batches.clear();
         self.clips.clear();
-        self.cursor = CursorIcon::Default;
+        self.cursor = Cursor::Default;
         self.blocked = false;
         self.focus_seen = false;
         self.text.reset = false;
+        self.images.begin_frame();
         self.batches.push(Batch {
             clip: [0, 0, i32::MAX, i32::MAX],
             first: 0,
@@ -346,7 +346,7 @@ impl Ui {
     /// quads. `None` means the glyph atlas was reset mid-frame and the
     /// frame must be built again.
     pub fn finish(&mut self) -> Option<(&[Quad], &[Batch])> {
-        if self.text.reset {
+        if self.text.reset || self.images.reset {
             return None;
         }
         if self.released {
@@ -366,11 +366,11 @@ impl Ui {
 
     /// Whether this frame had a key press of Escape (for closing dialogs).
     pub fn escape(&self) -> bool {
-        !self.blocked && self.keys.contains(&KeyPress::Escape)
+        !self.blocked && self.keys().any(|(_, k)| k.key == Key::Named(Named::Escape))
     }
 
     pub fn ctrl(&self) -> bool {
-        self.modifiers.control_key() || self.modifiers.meta_key()
+        self.modifiers.ctrl || self.modifiers.logo
     }
 
     /// Clipboard text for the focused text field, inserted on the next build.
@@ -421,6 +421,59 @@ impl Ui {
         });
     }
 
+    /// A soft drop shadow under the rounded rectangle `r`, spreading `blur`
+    /// pixels beyond it, offset by `(dx, dy)`.
+    pub fn shadow(&mut self, r: Rect, color: Color, radius: f32, blur: f32, dx: f32, dy: f32) {
+        if color.1 == 0 {
+            return;
+        }
+        let grown = Rect::new(r.x + dx - blur, r.y + dy - blur, r.w + 2.0 * blur, r.h + 2.0 * blur);
+        self.push(Quad {
+            rect: self.physical(grown),
+            uv: [0.0; 4],
+            color: color.packed(),
+            params: [(radius + blur) * self.scale, blur * self.scale, MODE_SHADOW],
+        });
+    }
+
+    /// Draws an image from [`Ui::images`] stretched over `r`, faded by
+    /// `alpha` and clipped to rounded corners of `radius`. Returns false if
+    /// there is no image with that id.
+    pub fn image(&mut self, r: Rect, id: ImageId, alpha: u8, radius: f32) -> bool {
+        let Some([x, y, w, h]) = self.images.slot(id) else {
+            return false;
+        };
+        let inv = 1.0 / IMAGE_ATLAS as f32;
+        // Half a texel in, so linear filtering stays inside the image.
+        let uv = [
+            (x as f32 + 0.5) * inv,
+            (y as f32 + 0.5) * inv,
+            ((x + w) as f32 - 0.5) * inv,
+            ((y + h) as f32 - 0.5) * inv,
+        ];
+        let mut rect = self.physical(r);
+        // A pixel-exact image is drawn unscaled, so it stays sharp.
+        if (rect[2] - w as f32).abs() <= 1.0 && (rect[3] - h as f32).abs() <= 1.0 {
+            rect[2] = w as f32;
+            rect[3] = h as f32;
+            let full = [x as f32 * inv, y as f32 * inv, (x + w) as f32 * inv, (y + h) as f32 * inv];
+            self.push(Quad { rect, uv: full, color: Color(0xffffff, alpha).packed(), params: [radius * self.scale, 0.0, MODE_IMAGE] });
+            return true;
+        }
+        self.push(Quad { rect, uv, color: Color(0xffffff, alpha).packed(), params: [radius * self.scale, 0.0, MODE_IMAGE] });
+        true
+    }
+
+    /// Like [`Ui::image`], keeping the image's aspect ratio inside `r`
+    /// (centered). Returns the rectangle drawn.
+    pub fn image_fit(&mut self, r: Rect, id: ImageId, alpha: u8, radius: f32) -> Option<Rect> {
+        let (w, h) = self.images.size(id)?;
+        let f = (r.w / w as f32).min(r.h / h as f32);
+        let (dw, dh) = (w as f32 * f, h as f32 * f);
+        let fit = Rect::new(r.x + (r.w - dw) * 0.5, r.y + (r.h - dh) * 0.5, dw, dh);
+        self.image(fit, id, alpha, radius).then_some(fit)
+    }
+
     /// Restricts drawing to `r` until [`Ui::pop_clip`].
     pub fn push_clip(&mut self, r: Rect) {
         let r = match self.clips.last() {
@@ -466,7 +519,22 @@ impl Ui {
         for c in s.chars() {
             let advance = self.text.advance(c, px);
             let whole = pen.floor();
-            if let Some(slot) = self.text.slot(c, px, pen - whole) {
+            if let Some(g) = self.text.color(c, px, &mut self.images) {
+                if let Some([ax, ay, aw, ah]) = self.images.slot(g.id) {
+                    let inv_i = 1.0 / IMAGE_ATLAS as f32;
+                    self.push(Quad {
+                        rect: [(whole + g.left).round(), (baseline - g.top).round(), g.w as f32, g.h as f32],
+                        uv: [
+                            ax as f32 * inv_i,
+                            ay as f32 * inv_i,
+                            (ax + aw) as f32 * inv_i,
+                            (ay + ah) as f32 * inv_i,
+                        ],
+                        color: Color(0xffffff, color.1).packed(),
+                        params: [0.0, 0.0, MODE_IMAGE],
+                    });
+                }
+            } else if let Some(slot) = self.text.slot(c, px, pen - whole) {
                 let gx = whole + slot.left as f32;
                 let gy = baseline - slot.top as f32;
                 self.push(Quad {
@@ -550,7 +618,7 @@ impl Ui {
             && hovered
             && (self.active == Some(id) || (self.pressed && pressed_here));
         if hovered {
-            self.cursor = CursorIcon::Pointer;
+            self.cursor = Cursor::Pointer;
         }
         Response { hovered, clicked }
     }
@@ -656,10 +724,28 @@ impl Ui {
         placeholder: &str,
         multiline: bool,
     ) -> Edit {
-        let t = self.theme;
+        let style = EditStyle { multiline, ..EditStyle::from_theme(&self.theme) };
+        self.text_edit_styled(id, r, value, placeholder, &style)
+    }
+
+    /// Moves a text field's caret (a byte index, clamped to the text).
+    pub fn set_caret(&mut self, id: Id, at: usize) {
+        self.cursors.insert(id, at);
+    }
+
+    /// [`Ui::text_edit`] with explicit looks and options.
+    pub fn text_edit_styled(
+        &mut self,
+        id: Id,
+        r: Rect,
+        value: &mut String,
+        placeholder: &str,
+        style: &EditStyle,
+    ) -> Edit {
+        let multiline = style.multiline;
         let res = self.interact(id, r);
         if res.hovered {
-            self.cursor = CursorIcon::Text;
+            self.cursor = Cursor::Text;
         }
         if res.clicked || (self.pressed && res.hovered) {
             self.focus = Some(id);
@@ -692,71 +778,132 @@ impl Ui {
             }
             let prev = |s: &str, i: usize| s[..i].char_indices().last().map_or(0, |(j, _)| j);
             let next = |s: &str, i: usize| s[i..].chars().next().map_or(i, |c| i + c.len_utf8());
-            for key in self.keys.clone() {
-                match key {
-                    KeyPress::Back if cursor > 0 => {
-                        let p = prev(value, cursor);
+            // Word boundaries: skip spaces, then non-spaces.
+            let prev_word = |s: &str, i: usize| {
+                let t = s[..i].trim_end_matches(|c: char| !c.is_alphanumeric());
+                t.rfind(|c: char| !c.is_alphanumeric()).map_or(0, |j| j + t[j..].chars().next().map_or(1, char::len_utf8))
+            };
+            let next_word = |s: &str, i: usize| {
+                let rest = &s[i..];
+                let skip = rest.len() - rest.trim_start_matches(|c: char| !c.is_alphanumeric()).len();
+                let rest2 = &rest[skip..];
+                i + skip + rest2.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest2.len())
+            };
+            let ctrl = self.ctrl();
+            let alt = self.modifiers.alt;
+            for i in 0..self.keys.len() {
+                if self.keys[i].1 {
+                    continue;
+                }
+                let key = self.keys[i].0.clone();
+                let mut used = true;
+                match key.key {
+                    Key::Named(Named::Backspace) if cursor > 0 => {
+                        let p = if ctrl { prev_word(value, cursor) } else { prev(value, cursor) };
                         value.replace_range(p..cursor, "");
                         cursor = p;
                         edit = Edit::Changed;
                     }
-                    KeyPress::Delete if cursor < value.len() => {
-                        let n = next(value, cursor);
+                    Key::Named(Named::Delete) if cursor < value.len() => {
+                        let n = if ctrl { next_word(value, cursor) } else { next(value, cursor) };
                         value.replace_range(cursor..n, "");
                         edit = Edit::Changed;
                     }
-                    KeyPress::Left => cursor = prev(value, cursor),
-                    KeyPress::Right => cursor = next(value, cursor),
-                    KeyPress::Home => cursor = if multiline { value[..cursor].rfind('\n').map_or(0, |i| i + 1) } else { 0 },
-                    KeyPress::End => cursor = if multiline { value[cursor..].find('\n').map_or(value.len(), |i| cursor + i) } else { value.len() },
-                    KeyPress::Enter if multiline && !self.ctrl() => {
+                    Key::Named(Named::Left) => cursor = if ctrl { prev_word(value, cursor) } else { prev(value, cursor) },
+                    Key::Named(Named::Right) => cursor = if ctrl { next_word(value, cursor) } else { next(value, cursor) },
+                    Key::Named(Named::Home) => cursor = if multiline { value[..cursor].rfind('\n').map_or(0, |i| i + 1) } else { 0 },
+                    Key::Named(Named::End) => cursor = if multiline { value[cursor..].find('\n').map_or(value.len(), |i| cursor + i) } else { value.len() },
+                    Key::Named(Named::Enter) if multiline && !ctrl => {
                         value.insert(cursor, '\n');
                         cursor += 1;
                         edit = Edit::Changed;
                     }
-                    KeyPress::Enter => edit = Edit::Submit,
-                    KeyPress::Escape => self.focus = None,
-                    _ => {}
+                    Key::Named(Named::Enter) => edit = Edit::Submit,
+                    Key::Named(Named::Escape) if style.escape_unfocuses => self.focus = None,
+                    // Emacs-style line kill, as in GTK entries.
+                    Key::Char('u') | Key::Char('U') if ctrl && !alt => {
+                        if cursor > 0 {
+                            value.replace_range(..cursor, "");
+                            cursor = 0;
+                            edit = Edit::Changed;
+                        }
+                    }
+                    Key::Char('w') | Key::Char('W') if ctrl && !alt && cursor > 0 => {
+                        let p = prev_word(value, cursor);
+                        value.replace_range(p..cursor, "");
+                        cursor = p;
+                        edit = Edit::Changed;
+                    }
+                    _ => match &key.text {
+                        Some(text) if !ctrl && !self.modifiers.logo => {
+                            let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                            if text.is_empty() {
+                                used = false;
+                            } else {
+                                value.insert_str(cursor, &text);
+                                cursor += text.len();
+                                edit = Edit::Changed;
+                            }
+                        }
+                        _ => used = false,
+                    },
+                }
+                if used {
+                    self.keys[i].1 = true;
                 }
             }
         }
         self.cursors.insert(id, cursor);
 
-        self.rect(r, t.surface, 8.0);
-        self.outline(r, if focused { t.accent } else { t.border }, 8.0, if focused { 1.5 } else { 1.0 });
-        let inner = r.inset(12.0, if multiline { 10.0 } else { 0.0 });
+        if let Some(bg) = style.bg {
+            self.rect(r, bg, style.radius);
+        }
+        if let Some(border) = style.border {
+            let color = if focused { style.focus_border.unwrap_or(border) } else { border };
+            self.outline(r, color, style.radius, if focused { 1.5 } else { 1.0 });
+        }
+        let inner = r.inset(style.pad, if multiline { 10.0 } else { 0.0 });
         self.push_clip(r.inset(2.0, 2.0));
-        let size = 14.0;
+        let size = style.size;
         let lh = self.line_height(size);
         if value.is_empty() {
             let pr = if multiline { Rect::new(inner.x, inner.y, inner.w, lh) } else { inner };
-            self.text_in(pr, placeholder, size, t.muted, Align::Left);
+            self.text_in(pr, placeholder, size, style.placeholder, Align::Left);
         }
+        // Password fields show one bullet per character.
+        let masked;
+        let (shown, shown_cursor): (&str, usize) = if style.password {
+            masked = "•".repeat(value.chars().count());
+            let n = value[..cursor].chars().count();
+            (&masked, n * '•'.len_utf8())
+        } else {
+            (value.as_str(), cursor)
+        };
         if multiline {
             let px = size * self.scale;
-            let lines = self.text.wrap(value, px, inner.w * self.scale);
+            let lines = self.text.wrap(shown, px, inner.w * self.scale);
             // Keep the caret's line visible.
             let caret_line = lines
                 .iter()
-                .rposition(|&(a, _)| a <= cursor)
+                .rposition(|&(a, _)| a <= shown_cursor)
                 .unwrap_or(0);
             let visible = ((inner.h / lh).floor() as usize).max(1);
             let first = (caret_line + 1).saturating_sub(visible);
             for (row, &(a, b)) in lines.iter().enumerate().skip(first).take(visible) {
                 let y = inner.y + (row - first) as f32 * lh;
-                self.label(inner.x, y, &value[a..b], size, t.text);
+                self.label(inner.x, y, &shown[a..b], size, style.text);
                 if focused && row == caret_line {
-                    let x = inner.x + self.measure(&value[a..cursor.min(b).max(a)], size);
-                    self.rect(Rect::new(x, y + 2.0, 1.5, lh - 4.0), t.accent, 0.0);
+                    let x = inner.x + self.measure(&shown[a..shown_cursor.min(b).max(a)], size);
+                    self.rect(Rect::new(x, y + 2.0, 1.5, lh - 4.0), style.caret, 0.0);
                 }
             }
         } else {
-            let before = self.measure(&value[..cursor], size);
+            let before = self.measure(&shown[..shown_cursor], size);
             let shift = (before - inner.w + 4.0).max(0.0);
             let y = inner.y + (inner.h - lh) * 0.5;
-            self.label(inner.x - shift, y, value, size, t.text);
-            if focused {
-                self.rect(Rect::new(inner.x - shift + before, y + 2.0, 1.5, lh - 4.0), t.accent, 0.0);
+            self.label(inner.x - shift, y, shown, size, style.text);
+            if focused && style.caret.1 > 0 {
+                self.rect(Rect::new(inner.x - shift + before, y + 2.0, 1.5, lh - 4.0), style.caret, 0.0);
             }
         }
         self.pop_clip();
@@ -764,17 +911,57 @@ impl Ui {
     }
 }
 
+/// Looks and options of a text field.
+#[derive(Clone, Copy, Debug)]
+pub struct EditStyle {
+    pub multiline: bool,
+    /// Show bullets instead of the text.
+    pub password: bool,
+    /// Escape takes the focus away (as in a form); a launcher's search
+    /// field keeps it.
+    pub escape_unfocuses: bool,
+    pub bg: Option<Color>,
+    pub border: Option<Color>,
+    pub focus_border: Option<Color>,
+    pub radius: f32,
+    /// Horizontal padding.
+    pub pad: f32,
+    pub size: f32,
+    pub text: Color,
+    pub placeholder: Color,
+    pub caret: Color,
+}
+
+impl EditStyle {
+    pub fn from_theme(t: &Theme) -> EditStyle {
+        EditStyle {
+            multiline: false,
+            password: false,
+            escape_unfocuses: true,
+            bg: Some(t.surface),
+            border: Some(t.border),
+            focus_border: Some(t.accent),
+            radius: 8.0,
+            pad: 12.0,
+            size: 14.0,
+            text: t.text,
+            placeholder: t.muted,
+            caret: t.accent,
+        }
+    }
+}
+
 /// Paste shortcuts: Ctrl+V (also Cmd+V and Ctrl+Shift+V), Shift+Insert and
 /// the Paste key. V is matched on the layout's own letter, or where V is on
 /// a US keyboard for layouts without Latin letters.
 fn is_paste(event: &KeyEvent, ctrl: bool, shift: bool) -> bool {
-    match &event.logical_key {
-        Key::Named(NamedKey::Paste) => return true,
-        Key::Named(NamedKey::Insert) => return shift && !ctrl,
+    match &event.key {
+        Key::Named(Named::Paste) => return true,
+        Key::Named(Named::Insert) => return shift && !ctrl,
         _ => {}
     }
-    ctrl && match &event.key_without_modifiers {
-        Key::Character(c) if c.is_ascii() => c.eq_ignore_ascii_case("v"),
-        _ => event.physical_key == PhysicalKey::Code(KeyCode::KeyV),
+    ctrl && match event.base {
+        Some(c) if c.is_ascii_alphabetic() => c.eq_ignore_ascii_case(&'v'),
+        _ => event.code == CODE_V,
     }
 }

@@ -3,7 +3,9 @@
 //! size, quarter-pixel offset) and then only composited.
 
 use crate::font::Font;
+use crate::image::{ImageId, Images};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Atlas side length. 1024² bytes hold well over a thousand UI glyphs.
 pub const ATLAS: u32 = 1024;
@@ -28,8 +30,27 @@ struct Key {
     bin: u8,
 }
 
+/// Font index of characters drawn as nothing (joiners, variation selectors).
+const INVISIBLE: u8 = u8::MAX;
+/// Most fonts kept open (primary, fallbacks, emoji).
+const MAX_FONTS: usize = 128;
+
+/// A colour glyph in the image atlas, placed like a [`Slot`].
+#[derive(Clone, Copy, Debug)]
+pub struct ColorSlot {
+    pub id: ImageId,
+    pub w: u32,
+    pub h: u32,
+    pub left: f32,
+    pub top: f32,
+}
+
 pub struct Text {
     fonts: Vec<Font>,
+    /// Fallback font files not opened yet (`None`: not listed yet).
+    fallback: Option<Vec<PathBuf>>,
+    /// The colour emoji font (`None`: not looked for yet; `Some(None)`: none).
+    emoji: Option<Option<u8>>,
     map: HashMap<char, (u8, u16)>,
     cache: HashMap<Key, Option<Slot>>,
     pub pixels: Vec<u8>,
@@ -104,6 +125,8 @@ impl Text {
         }
         Ok(Text {
             fonts,
+            fallback: None,
+            emoji: None,
             map: HashMap::new(),
             cache: HashMap::new(),
             pixels: vec![0; (ATLAS * ATLAS) as usize],
@@ -119,14 +142,71 @@ impl Text {
         if let Some(&hit) = self.map.get(&c) {
             return hit;
         }
-        let found = self
-            .fonts
-            .iter()
-            .enumerate()
-            .find_map(|(i, font)| font.glyph(c).map(|g| (i as u8, g)))
-            .unwrap_or((0, 0)); // Glyph 0: the primary font's "missing" box.
+        let found = if is_invisible(c) {
+            (INVISIBLE, 0)
+        } else {
+            self.find(c).unwrap_or((0, 0)) // Glyph 0: the primary font's "missing" box.
+        };
         self.map.insert(c, found);
         found
+    }
+
+    fn find(&mut self, c: char) -> Option<(u8, u16)> {
+        if is_emoji(c)
+            && let Some(i) = self.emoji_font()
+            && let Some(g) = self.fonts[i as usize].glyph(c)
+        {
+            return Some((i, g));
+        }
+        if let Some(hit) = self.fonts.iter().enumerate().find_map(|(i, font)| font.glyph(c).map(|g| (i as u8, g))) {
+            return Some(hit);
+        }
+        // Open more fallback fonts until one has the character.
+        let list = self.fallback.get_or_insert_with(fallback_fonts);
+        while self.fonts.len() < MAX_FONTS {
+            let Some(path) = list.pop() else { break };
+            let Some(font) = Font::open(&path) else { continue };
+            let glyph = font.glyph(c);
+            self.fonts.push(font);
+            if let Some(g) = glyph {
+                return Some(((self.fonts.len() - 1) as u8, g));
+            }
+        }
+        None
+    }
+
+    fn emoji_font(&mut self) -> Option<u8> {
+        if let Some(found) = self.emoji {
+            return found;
+        }
+        let found = emoji_font_path().and_then(|path| Font::open(&path)).and_then(|font| {
+            (self.fonts.len() < MAX_FONTS).then(|| {
+                self.fonts.push(font);
+                (self.fonts.len() - 1) as u8
+            })
+        });
+        self.emoji = Some(found);
+        found
+    }
+
+    /// The colour image for `c` at `px`, if its font has colour glyphs.
+    /// Decoded into `images` on first use.
+    pub fn color(&mut self, c: char, px: f32, images: &mut Images) -> Option<ColorSlot> {
+        let (font, glyph) = self.lookup(c);
+        if font == INVISIBLE || !self.fonts[font as usize].is_color() {
+            return None;
+        }
+        let f = &self.fonts[font as usize];
+        let bitmap = f.color_bitmap(glyph, px)?;
+        let scale = px / bitmap.ppem;
+        let w = ((bitmap.width as f32 * scale).round() as u32).max(1);
+        let h = ((bitmap.height as f32 * scale).round() as u32).max(1);
+        let id = color_id(font, glyph, w);
+        if !images.contains(id) {
+            let (bw, bh, rgba) = crate::image::decode_png(bitmap.png)?;
+            images.insert(id, w, h, crate::image::resize(&rgba, bw, bh, w, h));
+        }
+        Some(ColorSlot { id, w, h, left: bitmap.bearing_x * scale, top: bitmap.bearing_y * scale })
     }
 
     pub fn ascent(&self, px: f32) -> f32 {
@@ -140,6 +220,9 @@ impl Text {
 
     pub fn advance(&mut self, c: char, px: f32) -> f32 {
         let (font, glyph) = self.lookup(c);
+        if font == INVISIBLE {
+            return 0.0;
+        }
         self.fonts[font as usize].advance(glyph) * px
     }
 
@@ -151,6 +234,9 @@ impl Text {
     /// glyphs without ink (spaces).
     pub fn slot(&mut self, c: char, px: f32, x_frac: f32) -> Option<Slot> {
         let (font, glyph) = self.lookup(c);
+        if font == INVISIBLE {
+            return None;
+        }
         let bin = ((x_frac * BINS) as u8).min(BINS as u8 - 1);
         let key = Key {
             font,
@@ -277,4 +363,56 @@ impl Text {
         lines.push((start, text.len()));
         lines
     }
+}
+
+/// Characters that take no space: zero-width (non-)joiners and spaces,
+/// direction marks, variation selectors and tag characters.
+fn is_invisible(c: char) -> bool {
+    matches!(c as u32, 0x200B..=0x200F | 0x2060..=0x2064 | 0xFE00..=0xFE0F | 0xE0020..=0xE007F | 0xFEFF)
+}
+
+/// Characters better drawn from the colour emoji font than from a text font
+/// that happens to have them.
+fn is_emoji(c: char) -> bool {
+    matches!(c as u32, 0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF)
+}
+
+fn color_id(font: u8, glyph: u16, w: u32) -> ImageId {
+    // High bit set: never collides with small app-chosen ids in practice.
+    (1 << 63) | ((font as u64) << 40) | ((glyph as u64) << 16) | (w as u64 & 0xFFFF)
+}
+
+/// Fallback font files from fontconfig, best last (they are popped).
+fn fallback_fonts() -> Vec<PathBuf> {
+    let mut list = fc_files(&["-s", "sans-serif"]);
+    list.reverse();
+    list
+}
+
+fn emoji_font_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("VKUI_EMOJI_FONT") {
+        return Some(path.into());
+    }
+    fc_files(&["emoji"]).into_iter().next()
+}
+
+/// Font files `fc-match` lists for a pattern (nothing without fontconfig).
+fn fc_files(args: &[&str]) -> Vec<PathBuf> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let out = std::process::Command::new("fc-match")
+            .args(args)
+            .arg("--format=%{file}\n")
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(out) = out {
+            return String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .collect();
+        }
+    }
+    let _ = args;
+    Vec::new()
 }

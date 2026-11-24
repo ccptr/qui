@@ -1,11 +1,11 @@
 #version 450
-// One instance = one quad: a rounded rectangle or a glyph.
+// One instance = one quad: a rounded rectangle, a shadow, a glyph or an image.
 layout(push_constant) uniform Push { vec2 screen; } push;
 
 layout(location = 0) in vec4 rect;    // x, y, w, h in pixels
-layout(location = 1) in vec4 uv;      // atlas u0, v0, u1, v1 (glyphs)
+layout(location = 1) in vec4 uv;      // atlas u0, v0, u1, v1 (glyphs, images)
 layout(location = 2) in vec4 color;   // RGBA8 unorm
-layout(location = 3) in vec3 params;  // corner radius, border width (0: filled), mode (0: rect, 1: glyph)
+layout(location = 3) in vec3 params;  // corner radius, border width or blur, mode (0 rect, 1 glyph, 2 image, 3 shadow)
 
 layout(location = 0) out vec2 v_local;
 layout(location = 1) out vec2 v_uv;

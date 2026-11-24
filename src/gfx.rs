@@ -1,15 +1,20 @@
 //! The Vulkan renderer: one pipeline drawing instanced quads (rounded
-//! rectangles and glyphs) from a host-visible instance buffer, an R8 glyph
-//! atlas, FIFO presentation and two frames in flight.
+//! rectangles, shadows, glyphs and images) from a host-visible instance
+//! buffer, an R8 glyph atlas and an RGBA image atlas, FIFO presentation and
+//! two frames in flight.
+//!
+//! The surface can be detached and attached again ([`Gfx::detach`],
+//! [`Gfx::attach`]), so a window that is hidden by destroying it keeps the
+//! device (fast to show again) but holds no swapchain images.
 //!
 //! Frames are only drawn when the UI output changed (see `App`), so an idle
 //! window costs nothing here.
 
+use crate::image::{IMAGE_ATLAS, Images};
 use crate::text::{ATLAS, Text};
 use ash::vk;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::ffi::{CStr, c_char};
-use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use winit::window::Window;
 
 const FRAMES: usize = 2;
 
@@ -23,9 +28,15 @@ pub struct Quad {
     pub uv: [f32; 4],
     /// RGBA8, little-endian (`0xAABBGGRR`).
     pub color: u32,
-    /// Corner radius, border width (0: filled), mode (0: rect, 1: glyph).
+    /// Corner radius, border width (0: filled) or blur radius (shadows),
+    /// mode (0: rect, 1: glyph, 2: image, 3: shadow).
     pub params: [f32; 3],
 }
+
+pub const MODE_RECT: f32 = 0.0;
+pub const MODE_GLYPH: f32 = 1.0;
+pub const MODE_IMAGE: f32 = 2.0;
+pub const MODE_SHADOW: f32 = 3.0;
 
 /// A run of quads drawn with one scissor rectangle.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,6 +84,14 @@ pub struct Gfx {
     atlas: vk::Image,
     atlas_memory: vk::DeviceMemory,
     atlas_view: vk::ImageView,
+    linear: vk::Sampler,
+    images: vk::Image,
+    images_memory: vk::DeviceMemory,
+    images_view: vk::ImageView,
+    /// Staging for image uploads, grown on demand.
+    image_staging: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, usize)>,
+    family: u32,
+    transparent: bool,
     staging: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     staging_mapped: *mut u8,
@@ -89,18 +108,82 @@ fn err(what: &str) -> impl Fn(vk::Result) -> String + '_ {
 }
 
 impl Gfx {
-    pub fn new(window: &dyn Window) -> Result<Gfx, String> {
-        unsafe { Self::create(window) }
+    #[cfg(feature = "winit")]
+    pub fn new(window: &dyn winit::window::Window) -> Result<Gfx, String> {
+        use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+        let display = window.display_handle().map_err(|e| e.to_string())?.as_raw();
+        let handle = window.window_handle().map_err(|e| e.to_string())?.as_raw();
+        let size = window.surface_size();
+        unsafe { Self::create(display, handle, (size.width, size.height), false, window.scale_factor()) }
     }
 
-    unsafe fn create(window: &dyn Window) -> Result<Gfx, String> {
+    /// Renders into a Wayland surface. With `transparent`, the swapchain
+    /// uses premultiplied alpha, so what isn't drawn shows what's below.
+    ///
+    /// # Safety
+    /// `display` and `surface` must be live `wl_display*` / `wl_surface*`
+    /// that outlive the swapchain (until [`Gfx::detach`] or drop).
+    pub unsafe fn wayland(
+        display: *mut std::ffi::c_void,
+        surface: *mut std::ffi::c_void,
+        size: (u32, u32),
+        transparent: bool,
+    ) -> Result<Gfx, String> {
+        let (display, handle) = wayland_handles(display, surface)?;
+        unsafe { Self::create(display, handle, size, transparent, 1.0) }
+    }
+
+    /// Destroys the swapchain and the Vulkan surface, keeping the device.
+    pub fn detach(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.destroy_swapchain_resources();
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+                self.swapchain = vk::SwapchainKHR::null();
+            }
+            if self.surface != vk::SurfaceKHR::null() {
+                self.surface_fn.destroy_surface(self.surface, None);
+                self.surface = vk::SurfaceKHR::null();
+            }
+        }
+        self.stale = true;
+    }
+
+    /// Renders into a new Wayland surface after [`Gfx::detach`].
+    ///
+    /// # Safety
+    /// As for [`Gfx::wayland`].
+    pub unsafe fn attach(
+        &mut self,
+        display: *mut std::ffi::c_void,
+        surface: *mut std::ffi::c_void,
+        size: (u32, u32),
+    ) -> Result<(), String> {
+        self.detach();
+        let (display, handle) = wayland_handles(display, surface)?;
+        let surface = unsafe { create_surface(&self._entry, &self.instance, display, handle, 1.0) }?;
+        let ok = unsafe { self.surface_fn.get_physical_device_surface_support(self.pdev, self.family, surface) }
+            .unwrap_or(false);
+        if !ok {
+            unsafe { self.surface_fn.destroy_surface(surface, None) };
+            return Err("The Vulkan device can't present to the new surface".into());
+        }
+        self.surface = surface;
+        self.extent = vk::Extent2D { width: size.0, height: size.1 };
+        self.stale = true;
+        Ok(())
+    }
+
+    unsafe fn create(
+        display: RawDisplayHandle,
+        handle: RawWindowHandle,
+        size: (u32, u32),
+        transparent: bool,
+        scale: f64,
+    ) -> Result<Gfx, String> {
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| format!("Vulkan is not available ({e})"))?;
-        let display = window
-            .display_handle()
-            .map_err(|e| e.to_string())?
-            .as_raw();
-        let handle = window.window_handle().map_err(|e| e.to_string())?.as_raw();
 
         let mut extensions: Vec<*const c_char> = vec![ash::khr::surface::NAME.as_ptr()];
         extensions.push(match (display, handle) {
@@ -144,7 +227,7 @@ impl Gfx {
         }
         .map_err(err("vkCreateInstance"))?;
 
-        let surface = unsafe { create_surface(&entry, &instance, display, handle, window) }?;
+        let surface = unsafe { create_surface(&entry, &instance, display, handle, scale) }?;
         let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
 
         // Prefer the integrated GPU: a few hundred quads never need more,
@@ -312,12 +395,57 @@ impl Gfx {
         .map_err(err("atlas view"))?;
         let (staging, staging_memory, staging_mapped) =
             host_buffer(&device, &memory_props, (ATLAS * ATLAS) as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+        let linear = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+        }
+        .map_err(err("sampler"))?;
+        let images = unsafe {
+            device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .extent(vk::Extent3D { width: IMAGE_ATLAS, height: IMAGE_ATLAS, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )
+        }
+        .map_err(err("image atlas"))?;
+        let requirements = unsafe { device.get_image_memory_requirements(images) };
+        let images_memory =
+            allocate(&device, &memory_props, requirements, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        unsafe { device.bind_image_memory(images, images_memory, 0) }.map_err(err("bind image atlas"))?;
+        let images_view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(images)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .subresource_range(color_range()),
+                None,
+            )
+        }
+        .map_err(err("image atlas view"))?;
 
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let bindings = [0, 1].map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        });
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -327,7 +455,7 @@ impl Gfx {
         .map_err(err("set layout"))?;
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 1,
+            descriptor_count: 2,
         }];
         let pool = unsafe {
             device.create_descriptor_pool(
@@ -352,13 +480,25 @@ impl Gfx {
             image_view: atlas_view,
             image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         }];
+        let images_info = [vk::DescriptorImageInfo {
+            sampler: linear,
+            image_view: images_view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        }];
         unsafe {
             device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&image_info)],
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&image_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&images_info),
+                ],
                 &[],
             )
         };
@@ -412,7 +552,6 @@ impl Gfx {
             });
         }
 
-        let size = window.surface_size();
         let mut gfx = Gfx {
             _entry: entry,
             instance,
@@ -426,8 +565,8 @@ impl Gfx {
             swapchain: vk::SwapchainKHR::null(),
             format: format.format,
             extent: vk::Extent2D {
-                width: size.width,
-                height: size.height,
+                width: size.0,
+                height: size.1,
             },
             views: Vec::new(),
             framebuffers: Vec::new(),
@@ -442,6 +581,13 @@ impl Gfx {
             atlas,
             atlas_memory,
             atlas_view,
+            linear,
+            images,
+            images_memory,
+            images_view,
+            image_staging: None,
+            family,
+            transparent,
             staging,
             staging_memory,
             staging_mapped,
@@ -487,6 +633,21 @@ impl Gfx {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             );
+            barrier(d, cmd, self.images, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            d.cmd_clear_color_image(
+                cmd,
+                self.images,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue::default(),
+                &[color_range()],
+            );
+            barrier(
+                d,
+                cmd,
+                self.images,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
             d.end_command_buffer(cmd).map_err(err("end"))?;
             let cmds = [cmd];
             d.reset_fences(&[self.frames[0].fence]).map_err(err("fence"))?;
@@ -507,6 +668,9 @@ impl Gfx {
     }
 
     fn rebuild(&mut self) -> Result<bool, String> {
+        if self.surface == vk::SurfaceKHR::null() {
+            return Ok(false);
+        }
         let d = &self.device;
         unsafe { d.device_wait_idle() }.map_err(err("wait idle"))?;
         let caps = unsafe {
@@ -537,13 +701,25 @@ impl Gfx {
         if caps.max_image_count > 0 {
             count = count.min(caps.max_image_count);
         }
-        let alpha = [
-            vk::CompositeAlphaFlagsKHR::OPAQUE,
-            vk::CompositeAlphaFlagsKHR::INHERIT,
-            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
-            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
-        ]
-        .into_iter()
+        // Transparent windows want premultiplied alpha (what the
+        // blending below produces); opaque ones don't care.
+        let alpha_order = if self.transparent {
+            [
+                vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+                vk::CompositeAlphaFlagsKHR::INHERIT,
+                vk::CompositeAlphaFlagsKHR::OPAQUE,
+                vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+            ]
+        } else {
+            [
+                vk::CompositeAlphaFlagsKHR::OPAQUE,
+                vk::CompositeAlphaFlagsKHR::INHERIT,
+                vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+                vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+            ]
+        };
+        let alpha = alpha_order
+            .into_iter()
         .find(|a| caps.supported_composite_alpha.contains(*a))
         .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
         let old = self.swapchain;
@@ -638,6 +814,7 @@ impl Gfx {
         batches: &[Batch],
         clear: [f32; 4],
         text: &mut Text,
+        images: &mut Images,
     ) -> Result<bool, String> {
         if self.stale && !self.rebuild()? {
             return Ok(false);
@@ -750,6 +927,10 @@ impl Gfx {
             }
         }
 
+        if !images.pending.is_empty() {
+            unsafe { self.upload_images(fi, cmd, images) }?;
+        }
+
         let clear_values = [vk::ClearValue {
             color: vk::ClearColorValue { float32: clear },
         }];
@@ -858,6 +1039,55 @@ impl Gfx {
         Ok(true)
     }
 
+    /// Records copies of the pending image-atlas rectangles.
+    unsafe fn upload_images(&mut self, fi: usize, cmd: vk::CommandBuffer, images: &mut Images) -> Result<(), String> {
+        let d = self.device.clone();
+        let total: usize = images.pending.iter().map(|u| u.data.len()).sum();
+        // The staging buffer is shared by both frames.
+        let fences: Vec<vk::Fence> =
+            self.frames.iter().enumerate().filter(|(i, _)| *i != fi).map(|(_, f)| f.fence).collect();
+        unsafe { d.wait_for_fences(&fences, true, u64::MAX) }.map_err(err("wait"))?;
+        if self.image_staging.as_ref().is_none_or(|s| s.3 < total) {
+            if let Some((buffer, memory, _, _)) = self.image_staging.take() {
+                unsafe {
+                    d.destroy_buffer(buffer, None);
+                    d.free_memory(memory, None);
+                }
+            }
+            let size = total.next_power_of_two().max(256 << 10);
+            let (buffer, memory, mapped) =
+                host_buffer(&d, &self.memory_props, size as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            self.image_staging = Some((buffer, memory, mapped, size));
+        }
+        let (buffer, _, mapped, _) = *self.image_staging.as_ref().unwrap();
+        let mut regions = Vec::with_capacity(images.pending.len());
+        let mut offset = 0usize;
+        for u in images.pending.drain(..) {
+            unsafe { std::ptr::copy_nonoverlapping(u.data.as_ptr(), mapped.add(offset), u.data.len()) };
+            regions.push(vk::BufferImageCopy {
+                buffer_offset: offset as u64,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: u.x as i32, y: u.y as i32, z: 0 },
+                image_extent: vk::Extent3D { width: u.w, height: u.h, depth: 1 },
+            });
+            // Offsets of texel copies must be multiples of 4 bytes: RGBA8 is.
+            offset += u.data.len();
+        }
+        unsafe {
+            barrier(&d, cmd, self.images, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            d.cmd_copy_buffer_to_image(cmd, buffer, self.images, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &regions);
+            barrier(&d, cmd, self.images, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+        Ok(())
+    }
+
     fn grow(&mut self, fi: usize, capacity: usize) -> Result<(), String> {
         let d = &self.device;
         let frame = &mut self.frames[fi];
@@ -902,6 +1132,14 @@ impl Drop for Gfx {
             d.destroy_descriptor_pool(self.pool, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
             d.destroy_sampler(self.sampler, None);
+            d.destroy_sampler(self.linear, None);
+            d.destroy_image_view(self.images_view, None);
+            d.destroy_image(self.images, None);
+            d.free_memory(self.images_memory, None);
+            if let Some((buffer, memory, _, _)) = self.image_staging.take() {
+                d.destroy_buffer(buffer, None);
+                d.free_memory(memory, None);
+            }
             d.destroy_image_view(self.atlas_view, None);
             d.destroy_image(self.atlas, None);
             d.free_memory(self.atlas_memory, None);
@@ -909,7 +1147,9 @@ impl Drop for Gfx {
             d.free_memory(self.staging_memory, None);
             d.destroy_render_pass(self.render_pass, None);
             d.destroy_device(None);
-            self.surface_fn.destroy_surface(self.surface, None);
+            if self.surface != vk::SurfaceKHR::null() {
+                self.surface_fn.destroy_surface(self.surface, None);
+            }
             self.instance.destroy_instance(None);
         }
     }
@@ -1135,7 +1375,7 @@ unsafe fn create_surface(
     instance: &ash::Instance,
     display: RawDisplayHandle,
     window: RawWindowHandle,
-    _winit: &dyn Window,
+    _scale: f64,
 ) -> Result<vk::SurfaceKHR, String> {
     let result = unsafe {
         match (display, window) {
@@ -1175,7 +1415,7 @@ unsafe fn create_surface(
             }
             #[cfg(target_os = "macos")]
             (_, RawWindowHandle::AppKit(w)) => {
-                let layer = macos::metal_layer(w.ns_view.as_ptr(), _winit.scale_factor());
+                let layer = macos::metal_layer(w.ns_view.as_ptr(), _scale);
                 ash::ext::metal_surface::Instance::new(entry, instance).create_metal_surface(
                     &vk::MetalSurfaceCreateInfoEXT::default().layer(layer.cast()),
                     None,
@@ -1185,6 +1425,20 @@ unsafe fn create_surface(
         }
     };
     result.map_err(err("vkCreate*SurfaceKHR"))
+}
+
+fn wayland_handles(
+    display: *mut std::ffi::c_void,
+    surface: *mut std::ffi::c_void,
+) -> Result<(RawDisplayHandle, RawWindowHandle), String> {
+    use raw_window_handle::{WaylandDisplayHandle, WaylandWindowHandle};
+    use std::ptr::NonNull;
+    let display = NonNull::new(display).ok_or("null wl_display")?;
+    let surface = NonNull::new(surface).ok_or("null wl_surface")?;
+    Ok((
+        RawDisplayHandle::Wayland(WaylandDisplayHandle::new(display)),
+        RawWindowHandle::Wayland(WaylandWindowHandle::new(surface)),
+    ))
 }
 
 /// A `CAMetalLayer` for an `NSView`, through the Objective-C runtime (what

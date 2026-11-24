@@ -728,6 +728,34 @@ impl Ui {
         self.text_edit_styled(id, r, value, placeholder, &style)
     }
 
+    /// Applies one key to a text field, as [`Ui::text_edit`] would.
+    /// Returns `None` if the field doesn't use the key. Lets an app handle
+    /// its own bindings and typing in the order the keys came.
+    pub fn text_edit_key(&mut self, id: Id, value: &mut String, key: &KeyEvent, multiline: bool) -> Option<Edit> {
+        let mut cursor = self.cursors.get(&id).copied().unwrap_or(value.len()).min(value.len());
+        while !value.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        let result = edit_key(value, &mut cursor, key, multiline);
+        self.cursors.insert(id, cursor);
+        Some(match result? {
+            KeyEdit::Changed => Edit::Changed,
+            KeyEdit::Submit => Edit::Submit,
+            KeyEdit::Moved | KeyEdit::Escape => Edit::None,
+        })
+    }
+
+    /// A scroll area's offset.
+    pub fn scroll_offset(&self, id: Id) -> f32 {
+        self.scroll.get(&id).map_or(0.0, |s| s.0)
+    }
+
+    /// Sets a scroll area's offset (clamped when the area is next built).
+    pub fn set_scroll_offset(&mut self, id: Id, offset: f32) {
+        let max = self.scroll.get(&id).map_or(f32::MAX, |s| s.1);
+        self.scroll.insert(id, (offset.max(0.0), max));
+    }
+
     /// Moves a text field's caret (a byte index, clamped to the text).
     pub fn set_caret(&mut self, id: Id, at: usize) {
         self.cursors.insert(id, at);
@@ -776,81 +804,20 @@ impl Ui {
                     edit = Edit::Changed;
                 }
             }
-            let prev = |s: &str, i: usize| s[..i].char_indices().last().map_or(0, |(j, _)| j);
-            let next = |s: &str, i: usize| s[i..].chars().next().map_or(i, |c| i + c.len_utf8());
-            // Word boundaries: skip spaces, then non-spaces.
-            let prev_word = |s: &str, i: usize| {
-                let t = s[..i].trim_end_matches(|c: char| !c.is_alphanumeric());
-                t.rfind(|c: char| !c.is_alphanumeric()).map_or(0, |j| j + t[j..].chars().next().map_or(1, char::len_utf8))
-            };
-            let next_word = |s: &str, i: usize| {
-                let rest = &s[i..];
-                let skip = rest.len() - rest.trim_start_matches(|c: char| !c.is_alphanumeric()).len();
-                let rest2 = &rest[skip..];
-                i + skip + rest2.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest2.len())
-            };
             for i in 0..self.keys.len() {
                 if self.keys[i].1 {
                     continue;
                 }
                 let key = self.keys[i].0.clone();
-                let ctrl = key.mods.ctrl || key.mods.logo;
-                let alt = key.mods.alt;
-                let mut used = true;
-                match key.key {
-                    Key::Named(Named::Backspace) if cursor > 0 => {
-                        let p = if ctrl { prev_word(value, cursor) } else { prev(value, cursor) };
-                        value.replace_range(p..cursor, "");
-                        cursor = p;
-                        edit = Edit::Changed;
-                    }
-                    Key::Named(Named::Delete) if cursor < value.len() => {
-                        let n = if ctrl { next_word(value, cursor) } else { next(value, cursor) };
-                        value.replace_range(cursor..n, "");
-                        edit = Edit::Changed;
-                    }
-                    Key::Named(Named::Left) => cursor = if ctrl { prev_word(value, cursor) } else { prev(value, cursor) },
-                    Key::Named(Named::Right) => cursor = if ctrl { next_word(value, cursor) } else { next(value, cursor) },
-                    Key::Named(Named::Home) => cursor = if multiline { value[..cursor].rfind('\n').map_or(0, |i| i + 1) } else { 0 },
-                    Key::Named(Named::End) => cursor = if multiline { value[cursor..].find('\n').map_or(value.len(), |i| cursor + i) } else { value.len() },
-                    Key::Named(Named::Enter) if multiline && !ctrl => {
-                        value.insert(cursor, '\n');
-                        cursor += 1;
-                        edit = Edit::Changed;
-                    }
-                    Key::Named(Named::Enter) => edit = Edit::Submit,
-                    Key::Named(Named::Escape) if style.escape_unfocuses => self.focus = None,
-                    // Emacs-style line kill, as in GTK entries.
-                    Key::Char('u') | Key::Char('U') if ctrl && !alt => {
-                        if cursor > 0 {
-                            value.replace_range(..cursor, "");
-                            cursor = 0;
-                            edit = Edit::Changed;
-                        }
-                    }
-                    Key::Char('w') | Key::Char('W') if ctrl && !alt && cursor > 0 => {
-                        let p = prev_word(value, cursor);
-                        value.replace_range(p..cursor, "");
-                        cursor = p;
-                        edit = Edit::Changed;
-                    }
-                    _ => match &key.text {
-                        Some(text) if !ctrl => {
-                            let text: String = text.chars().filter(|c| !c.is_control()).collect();
-                            if text.is_empty() {
-                                used = false;
-                            } else {
-                                value.insert_str(cursor, &text);
-                                cursor += text.len();
-                                edit = Edit::Changed;
-                            }
-                        }
-                        _ => used = false,
-                    },
+                match edit_key(value, &mut cursor, &key, multiline) {
+                    None => continue,
+                    Some(KeyEdit::Changed) => edit = Edit::Changed,
+                    Some(KeyEdit::Submit) => edit = Edit::Submit,
+                    Some(KeyEdit::Escape) if style.escape_unfocuses => self.focus = None,
+                    Some(KeyEdit::Escape) => continue,
+                    Some(KeyEdit::Moved) => {}
                 }
-                if used {
-                    self.keys[i].1 = true;
-                }
+                self.keys[i].1 = true;
             }
         }
         self.cursors.insert(id, cursor);
@@ -911,6 +878,102 @@ impl Ui {
     }
 }
 
+/// What a key did to a text field.
+enum KeyEdit {
+    Changed,
+    Moved,
+    Submit,
+    Escape,
+}
+
+/// Applies a key to `value` at `cursor`; `None` if the key isn't for
+/// text editing.
+fn edit_key(value: &mut String, cursor: &mut usize, key: &KeyEvent, multiline: bool) -> Option<KeyEdit> {
+    let prev = |s: &str, i: usize| s[..i].char_indices().last().map_or(0, |(j, _)| j);
+    let next = |s: &str, i: usize| s[i..].chars().next().map_or(i, |c| i + c.len_utf8());
+    // Word boundaries: skip separators, then the word.
+    let prev_word = |s: &str, i: usize| {
+        let t = s[..i].trim_end_matches(|c: char| !c.is_alphanumeric());
+        t.rfind(|c: char| !c.is_alphanumeric()).map_or(0, |j| j + t[j..].chars().next().map_or(1, char::len_utf8))
+    };
+    let next_word = |s: &str, i: usize| {
+        let rest = &s[i..];
+        let skip = rest.len() - rest.trim_start_matches(|c: char| !c.is_alphanumeric()).len();
+        let rest2 = &rest[skip..];
+        i + skip + rest2.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest2.len())
+    };
+    let ctrl = key.mods.ctrl || key.mods.logo;
+    let alt = key.mods.alt;
+    let c = *cursor;
+    Some(match key.key {
+        Key::Named(Named::Backspace) => {
+            if c == 0 {
+                return Some(KeyEdit::Moved);
+            }
+            let p = if ctrl { prev_word(value, c) } else { prev(value, c) };
+            value.replace_range(p..c, "");
+            *cursor = p;
+            KeyEdit::Changed
+        }
+        Key::Named(Named::Delete) => {
+            if c >= value.len() {
+                return Some(KeyEdit::Moved);
+            }
+            let n = if ctrl { next_word(value, c) } else { next(value, c) };
+            value.replace_range(c..n, "");
+            KeyEdit::Changed
+        }
+        Key::Named(Named::Left) => {
+            *cursor = if ctrl { prev_word(value, c) } else { prev(value, c) };
+            KeyEdit::Moved
+        }
+        Key::Named(Named::Right) => {
+            *cursor = if ctrl { next_word(value, c) } else { next(value, c) };
+            KeyEdit::Moved
+        }
+        Key::Named(Named::Home) => {
+            *cursor = if multiline { value[..c].rfind('\n').map_or(0, |i| i + 1) } else { 0 };
+            KeyEdit::Moved
+        }
+        Key::Named(Named::End) => {
+            *cursor = if multiline { value[c..].find('\n').map_or(value.len(), |i| c + i) } else { value.len() };
+            KeyEdit::Moved
+        }
+        Key::Named(Named::Enter) if multiline && !ctrl => {
+            value.insert(c, '\n');
+            *cursor += 1;
+            KeyEdit::Changed
+        }
+        Key::Named(Named::Enter) => KeyEdit::Submit,
+        Key::Named(Named::Escape) => KeyEdit::Escape,
+        // Emacs-style line kill and word rubout, as in GTK entries.
+        Key::Char('u') | Key::Char('U') | Key::Char('w') | Key::Char('W') if ctrl && !alt && c == 0 => KeyEdit::Moved,
+        Key::Char('u') | Key::Char('U') if ctrl && !alt => {
+            value.replace_range(..c, "");
+            *cursor = 0;
+            KeyEdit::Changed
+        }
+        Key::Char('w') | Key::Char('W') if ctrl && !alt => {
+            let p = prev_word(value, c);
+            value.replace_range(p..c, "");
+            *cursor = p;
+            KeyEdit::Changed
+        }
+        _ => match &key.text {
+            Some(text) if !ctrl => {
+                let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                if text.is_empty() {
+                    return None;
+                }
+                value.insert_str(c, &text);
+                *cursor += text.len();
+                KeyEdit::Changed
+            }
+            _ => return None,
+        },
+    })
+}
+
 /// Looks and options of a text field.
 #[derive(Clone, Copy, Debug)]
 pub struct EditStyle {
@@ -963,5 +1026,32 @@ fn is_paste(event: &KeyEvent, ctrl: bool, shift: bool) -> bool {
     ctrl && match event.base {
         Some(c) if c.is_ascii_alphabetic() => c.eq_ignore_ascii_case(&'v'),
         _ => event.code == CODE_V,
+    }
+}
+
+#[cfg(test)]
+mod edit_key_tests {
+    use super::*;
+    use crate::input::Mods;
+
+    fn key(k: Key, text: Option<&str>, ctrl: bool) -> KeyEvent {
+        KeyEvent { key: k, text: text.map(String::from), keysym: 0, base: None, code: 0, repeat: false, mods: Mods { ctrl, ..Mods::NONE } }
+    }
+
+    #[test]
+    fn words_and_kills() {
+        let mut v = "open the door".to_string();
+        let mut c = v.len();
+        assert!(matches!(edit_key(&mut v, &mut c, &key(Key::Named(Named::Backspace), None, true), false), Some(KeyEdit::Changed)));
+        assert_eq!((v.as_str(), c), ("open the ", 9));
+        edit_key(&mut v, &mut c, &key(Key::Named(Named::Left), None, true), false);
+        assert_eq!(c, 5);
+        edit_key(&mut v, &mut c, &key(Key::Char('u'), None, true), false);
+        assert_eq!((v.as_str(), c), ("the ", 0));
+        assert!(matches!(edit_key(&mut v, &mut c, &key(Key::Char('u'), None, true), false), Some(KeyEdit::Moved)));
+        edit_key(&mut v, &mut c, &key(Key::Char('é'), Some("é"), false), false);
+        assert_eq!((v.as_str(), c), ("éthe ", 2));
+        // Ctrl+letters that aren't editing keys are left alone.
+        assert!(edit_key(&mut v, &mut c, &key(Key::Char('e'), Some("e"), true), false).is_none());
     }
 }

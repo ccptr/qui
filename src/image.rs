@@ -203,8 +203,8 @@ pub fn decode_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         let (w, h) = (info.width, info.height);
         let rgba = match info.color_type {
             png::ColorType::Rgba => buf,
-            png::ColorType::Rgb => buf.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
-            png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+            png::ColorType::Rgb => buf.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+            png::ColorType::GrayscaleAlpha => buf.as_chunks::<2>().0.iter().flat_map(|&[g, a]| [g, g, g, a]).collect(),
             png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
             png::ColorType::Indexed => return None,
         };
@@ -218,10 +218,10 @@ pub fn decode_png(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 fn premultiply(rgba: &mut [u8]) {
-    for px in rgba.chunks_exact_mut(4) {
-        let a = px[3] as u32;
+    for [r, g, b, a] in rgba.as_chunks_mut::<4>().0 {
+        let a = *a as u32;
         if a < 255 {
-            for c in &mut px[..3] {
+            for c in [r, g, b] {
                 *c = ((*c as u32 * a + 127) / 255) as u8;
             }
         }

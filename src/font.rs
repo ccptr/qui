@@ -726,7 +726,7 @@ mod tests {
         let g = font.glyph('A').unwrap();
         let bmp = font.rasterize(g, 32.0, 0.0).unwrap();
         assert!(bmp.width > 10 && bmp.height > 15);
-        assert!(bmp.coverage.iter().any(|&c| c == 255));
+        assert!(bmp.coverage.contains(&255));
         assert!(font.glyph('\u{10FFFF}').is_none());
         // Composite glyph (Ä is often composed of A + diaeresis).
         let g = font.glyph('Ä').unwrap();

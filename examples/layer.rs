@@ -2,8 +2,8 @@
 //! --features png`. Escape or a click
 //! outside hides it for a second, then it comes back; Ctrl+Q quits.
 
-use vkui::wl::{self, Cx, Spec, Waker};
-use vkui::{Align, Color, Key, Rect, Ui, id};
+use qui::wl::{self, Cx, Spec, Waker};
+use qui::{Align, Color, Key, Rect, Ui, id};
 
 struct Demo {
     text: String,
@@ -14,9 +14,9 @@ struct Demo {
 impl Demo {
     fn spec() -> Spec {
         if std::env::args().any(|a| a == "--window") {
-            return Spec { min_size: (300, 200), ..Spec::window("vkui demo", "vkui-demo", 520, 300) };
+            return Spec { min_size: (300, 200), ..Spec::window("qui demo", "qui-demo", 520, 300) };
         }
-        Spec { namespace: "vkui-demo".into(), width: 520, height: 300, ..Spec::default() }
+        Spec { namespace: "qui-demo".into(), width: 520, height: 300, ..Spec::default() }
     }
     fn hide_for_a_second(&self, cx: &mut Cx) {
         cx.hide = true;
@@ -34,9 +34,9 @@ impl wl::App for Demo {
     }
 
     fn build(&mut self, ui: &mut Ui, cx: &mut Cx) {
-        let keys: Vec<(usize, vkui::KeyEvent)> = ui.keys().map(|(i, k)| (i, k.clone())).collect();
+        let keys: Vec<(usize, qui::KeyEvent)> = ui.keys().map(|(i, k)| (i, k.clone())).collect();
         for (i, k) in keys {
-            if k.key == Key::Named(vkui::Named::Escape) {
+            if k.key == Key::Named(qui::Named::Escape) {
                 ui.consume_key(i);
                 self.hide_for_a_second(cx);
             }

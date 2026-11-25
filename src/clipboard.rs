@@ -137,7 +137,7 @@ mod paste_tests {
 
     #[test]
     fn pasted_repeats() {
-        let dir = std::env::temp_dir().join(format!("vkui-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("qui-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a b.png");
         std::fs::write(&file, b"PNG").unwrap();

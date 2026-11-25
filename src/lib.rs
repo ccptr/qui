@@ -1,4 +1,4 @@
-//! `vkui`: a small immediate-mode GUI toolkit for one window, on Wayland.
+//! `qui`: a small immediate-mode GUI toolkit for one window, on Wayland.
 //!
 //! * [`font`]: TrueType parsing and rasterization (no font crates).
 //! * [`text`]: glyph cache and atlas, measuring, eliding, wrapping.

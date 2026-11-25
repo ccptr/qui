@@ -95,7 +95,7 @@ pub enum Event {
     Focus(bool),
 }
 
-/// Pointer cursor shapes vkui asks for.
+/// Pointer cursor shapes qui asks for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Cursor {
     #[default]

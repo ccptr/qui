@@ -390,7 +390,7 @@ fn fallback_fonts() -> Vec<PathBuf> {
 }
 
 fn emoji_font_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("VKUI_EMOJI_FONT") {
+    if let Ok(path) = std::env::var("QUI_EMOJI_FONT") {
         return Some(path.into());
     }
     fc_files(&["emoji"]).into_iter().next()

@@ -1,4 +1,4 @@
-//! vkui's windowing: a native Wayland client. It shows one surface at a
+//! qui's windowing: a native Wayland client. It shows one surface at a
 //! time, either a layer-shell overlay (launchers, panels) or a normal
 //! window (an `xdg_toplevel`, with server-side decorations where the
 //! compositor offers them).
@@ -158,13 +158,13 @@ impl Default for Spec {
             margin: [0; 4],
             exclusive_zone: -1,
             keyboard: Keyboard::OnDemand,
-            namespace: "vkui".into(),
+            namespace: "qui".into(),
             width: 600,
             height: 400,
             transparent: true,
             blur: None,
             title: String::new(),
-            app_id: "vkui".into(),
+            app_id: "qui".into(),
             resizable: false,
             min_size: (0, 0),
             keep_when_hidden: false,
@@ -329,8 +329,8 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
         batches: Vec::new(),
         cursor: Cursor::Default,
         dirty: false,
-        stats: std::env::var_os("VKUI_STATS").is_some() || std::env::var_os("RLS_STATS").is_some(),
-        trace: std::env::var_os("VKUI_EVENTS").is_some() || std::env::var_os("RLS_EVENTS").is_some(),
+        stats: std::env::var_os("QUI_STATS").is_some() || std::env::var_os("RLS_STATS").is_some(),
+        trace: std::env::var_os("QUI_EVENTS").is_some() || std::env::var_os("RLS_EVENTS").is_some(),
         started: std::time::Instant::now(),
         frames: 0,
         shown_at: None,
@@ -389,17 +389,17 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
 
 // ---- the runner -------------------------------------------------------------------
 
-/// VKUI_STATS: a line stamped with the monotonic clock, in ms (comparable
+/// QUI_STATS: a line stamped with the monotonic clock, in ms (comparable
 /// across processes, e.g. with the time a client sent a request).
 fn stat(msg: std::fmt::Arguments) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VKUI_STATS").is_some() || std::env::var_os("RLS_STATS").is_some()) {
+    if !*ON.get_or_init(|| std::env::var_os("QUI_STATS").is_some() || std::env::var_os("RLS_STATS").is_some()) {
         return;
     }
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     let ms = ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6;
-    eprintln!("vkui: [{ms:.1}] {msg}");
+    eprintln!("qui: [{ms:.1}] {msg}");
 }
 
 struct Runner<A: App> {
@@ -414,11 +414,11 @@ struct Runner<A: App> {
     /// A frame is built but not yet presented.
     dirty: bool,
     stats: bool,
-    /// VKUI_EVENTS: log every input event.
+    /// QUI_EVENTS: log every input event.
     trace: bool,
     started: std::time::Instant,
     frames: u64,
-    /// When the surface was last created (for VKUI_STATS).
+    /// When the surface was last created (for QUI_STATS).
     shown_at: Option<std::time::Instant>,
 }
 
@@ -468,7 +468,7 @@ impl<A: App> Runner<A> {
         let events = std::mem::take(&mut state.events);
         if self.trace {
             for e in &events {
-                eprintln!("vkui: {:>8} ms {e:?}", self.started.elapsed().as_millis());
+                eprintln!("qui: {:>8} ms {e:?}", self.started.elapsed().as_millis());
             }
         }
         if let Some(ui) = &mut self.ui {
@@ -498,7 +498,7 @@ impl<A: App> Runner<A> {
                 None => {
                     let gfx = unsafe { Gfx::wayland(display, surface, (pw, ph), s.spec.transparent) }?;
                     if self.stats {
-                        eprintln!("vkui: rendering on {}", gfx.device_name);
+                        eprintln!("qui: rendering on {}", gfx.device_name);
                     }
                     self.gfx = Some(gfx);
                 }
@@ -581,7 +581,7 @@ impl<A: App> Runner<A> {
             if self.stats {
                 stat(format_args!("frame {} presented", self.frames));
                 if let Some(at) = self.shown_at.take() {
-                    eprintln!("vkui: shown in {:.1} ms", at.elapsed().as_secs_f64() * 1000.0);
+                    eprintln!("qui: shown in {:.1} ms", at.elapsed().as_secs_f64() * 1000.0);
                 }
             }
         }
@@ -812,7 +812,7 @@ impl State {
             None => std::ptr::null_mut(),
         };
         if xkb_ctx.is_null() {
-            eprintln!("vkui: libxkbcommon is missing; keyboard input won't work");
+            eprintln!("qui: libxkbcommon is missing; keyboard input won't work");
         }
         let seat = globals.bind::<wl_seat::WlSeat, _, _>(qh, 1..=8, ()).ok();
         let data_manager = globals.bind::<wl_data_device_manager::WlDataDeviceManager, _, _>(qh, 1..=3, ()).ok();
@@ -942,7 +942,7 @@ impl State {
         let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&content, qh, ()));
         let use_layer = spec.layer_shell && self.layer_shell.is_some() && self.subcompositor.is_some();
         if spec.layer_shell && !use_layer {
-            eprintln!("vkui: the compositor has no layer-shell; showing a normal window");
+            eprintln!("qui: the compositor has no layer-shell; showing a normal window");
         }
         let role = if use_layer {
             let base = self.compositor.create_surface(qh, ());
@@ -1431,7 +1431,7 @@ fn transparent_buffer(state: &State, qh: &QueueHandle<State>) -> Option<wl_buffe
         return Some(sp.create_u32_rgba_buffer(0, 0, 0, 0, qh, ()));
     }
     let shm = state.shm.as_ref()?;
-    let fd = unsafe { libc::memfd_create(c"vkui".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"qui".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return None;
     }

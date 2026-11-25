@@ -186,7 +186,7 @@ impl Gfx {
             layers.push(c"VK_LAYER_KHRONOS_validation".as_ptr());
         }
         let app = vk::ApplicationInfo::default()
-            .application_name(c"vkui")
+            .application_name(c"qui")
             .api_version(vk::API_VERSION_1_0);
         let instance = unsafe {
             entry.create_instance(

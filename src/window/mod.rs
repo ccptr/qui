@@ -14,10 +14,10 @@
 //!
 //! # Backends
 //!
-//! [`run`] uses Wayland, as a native client. Without Wayland (no
-//! `WAYLAND_DISPLAY` but a `DISPLAY`) it runs the same app on X11 instead
-//! (the `x11` feature, on by default). `QUI_BACKEND=x11` or `wayland` picks
-//! one.
+//! [`run`] uses Wayland, as a native client (the `wayland` feature).
+//! Without Wayland (no `WAYLAND_DISPLAY` but a `DISPLAY`) it runs the same
+//! app on X11 instead (the `x11` feature). Both features are on by default,
+//! and at least one is needed. `QUI_BACKEND=x11` or `wayland` picks one.
 //!
 //! On X11, as a client of libxcb (opened at run time, through x11rb), with
 //! xkbcommon-x11 for the keyboard and Vulkan's `VK_KHR_xcb_surface`, this
@@ -53,9 +53,11 @@ use std::ffi::{CString, c_char};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "wayland")]
 use wayland_client::Connection;
 use xkbcommon_dl as xkb;
 
+#[cfg(feature = "wayland")]
 mod wayland;
 #[cfg(feature = "x11")]
 mod x11;
@@ -308,19 +310,18 @@ pub fn keysym_to_lower(sym: u32) -> u32 {
 /// Runs until [`Cx::exit`]: on Wayland, or on X11 where there is no
 /// Wayland (see the module docs).
 pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
-    #[cfg(feature = "x11")]
+    match std::env::var("QUI_BACKEND").as_deref() {
+        Ok("wayland") => return run_wayland(make),
+        Ok("x11") => return run_x11(make),
+        _ => {}
+    }
+    #[cfg(all(feature = "wayland", feature = "x11"))]
     {
         let env = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-        let display = env("DISPLAY");
-        let x11 = match std::env::var("QUI_BACKEND").as_deref() {
-            Ok("x11") => Some(true),
-            Ok("wayland") => Some(false),
-            _ => None,
-        };
-        if x11.unwrap_or(display && !env("WAYLAND_DISPLAY") && !env("WAYLAND_SOCKET")) {
-            return x11::run(make);
-        }
-        if x11.is_none() && display {
+        if env("DISPLAY") {
+            if !env("WAYLAND_DISPLAY") && !env("WAYLAND_SOCKET") {
+                return x11::run(make);
+            }
             return match Connection::connect_to_env() {
                 Ok(conn) => wayland::run(conn, make),
                 Err(e) => {
@@ -330,8 +331,26 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
             };
         }
     }
+    if cfg!(feature = "wayland") { run_wayland(make) } else { run_x11(make) }
+}
+
+#[cfg(feature = "wayland")]
+fn run_wayland<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     let conn = Connection::connect_to_env().map_err(|e| format!("Cannot connect to Wayland: {e}"))?;
     wayland::run(conn, make)
+}
+
+#[cfg(not(feature = "wayland"))]
+fn run_wayland<A: App>(_make: impl FnOnce(Waker) -> A) -> Result<(), String> {
+    Err("qui was built without Wayland support (the wayland feature)".into())
+}
+
+#[cfg(feature = "x11")]
+use x11::run as run_x11;
+
+#[cfg(not(feature = "x11"))]
+fn run_x11<A: App>(_make: impl FnOnce(Waker) -> A) -> Result<(), String> {
+    Err("qui was built without X11 support (the x11 feature)".into())
 }
 
 // ---- shared by the backends ------------------------------------------------------
@@ -585,6 +604,8 @@ pub(crate) enum Fetched {
     Field(String),
     Pasted(Pasted),
     Dropped(Vec<PathBuf>),
+    /// Only Wayland reports failures to read.
+    #[cfg_attr(not(feature = "wayland"), allow(dead_code))]
     Error(String),
 }
 

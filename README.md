@@ -37,8 +37,9 @@ rendered when the quads changed.
 * `window/`: the windowing. `mod.rs` holds what the backends share: the API
   (`App`, `Spec`, `Cx`, `run`), the frame building and drawing, key translation
   and paste handling. `run` picks a backend.
-* `window/wayland.rs`: a native Wayland client on `wayland-client` (libwayland
-  and libxkbcommon are opened at run time). One `poll` over the Wayland socket, a
+* `window/wayland.rs`: a native Wayland client on `wayland-client` (the
+  `wayland` feature, on by default; libwayland and libxkbcommon are opened at
+  run time). One `poll` over the Wayland socket, a
   wake-up eventfd and the key-repeat timerfd. It shows a normal window (with
   server-side decorations through `xdg-decoration` where offered) or a layer-shell
   overlay; fractional scaling, cursor shapes, IME through `text-input-v3`, the
@@ -48,7 +49,8 @@ rendered when the quads changed.
 * `window/x11.rs`: the same apps on X11 (the `x11` feature, on by default), used when
   there is a `DISPLAY` but no Wayland; `QUI_BACKEND=x11` or `wayland` forces one.
   It is an x11rb client of libxcb (opened at run time), with xkbcommon-x11 for the
-  keyboard and `VK_KHR_xcb_surface`. A layer-shell spec becomes an override-redirect
+  keyboard and `VK_KHR_xcb_surface`, which both need libxcb's connection rather
+  than x11rb's pure-Rust one. A layer-shell spec becomes an override-redirect
   window placed by its anchors and margins on the monitor under the pointer; with
   an exclusive keyboard it grabs the keyboard and pointer, so clicks elsewhere are
   clicks outside. The scale is `Xft.dpi` / 96. Hiding a `keep_when_hidden` window

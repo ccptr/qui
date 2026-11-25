@@ -13,20 +13,24 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "debug
 png = { version = "0.18", optional = true }
 memmap2 = "0.9"
 libc = "0.2"
-# The windowing is a native Wayland client; libwayland and libxkbcommon
-# are opened at runtime.
-wayland-client = "0.31"
-wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
-wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# libxkbcommon, for the keyboard on both backends, is opened at run time.
 xkbcommon-dl = "0.4"
+# The Wayland backend, a native client; libwayland is opened at run time.
+wayland-client = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", optional = true, features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.32", optional = true, features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", optional = true, features = ["client"] }
 # The X11 backend (where there is no Wayland): libxcb is opened at run
-# time too; x11rb's themed cursors and resource database are pure Rust.
+# time too. It is the libxcb connection (`dl-libxcb`, which needs
+# `allow-unsafe-code`), not x11rb's pure-Rust one, because Vulkan's xcb
+# surface and xkbcommon-x11 both take an `xcb_connection_t*`. x11rb's themed
+# cursors and resource database are pure Rust.
 x11rb = { version = "0.13", optional = true, features = ["allow-unsafe-code", "dl-libxcb", "xkb", "randr", "cursor", "resource_manager"] }
 
 [features]
-default = ["x11"]
+default = ["wayland", "x11"]
 png = ["dep:png"]
+wayland = ["dep:wayland-client", "dep:wayland-backend", "dep:wayland-protocols", "dep:wayland-protocols-wlr"]
 x11 = ["dep:x11rb", "xkbcommon-dl/x11"]
 
 [[example]]

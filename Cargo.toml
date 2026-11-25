@@ -3,7 +3,7 @@ name = "qui"
 description = "A minimal immediate-mode GUI toolkit on Vulkan (ash) and native Wayland (windows and layer-shell surfaces), with its own TrueType rasterizer"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # `loaded`: libvulkan is opened at runtime, so the binary starts (and can

@@ -2,7 +2,7 @@
 //! --features png`. Escape or a click
 //! outside hides it for a second, then it comes back; Ctrl+Q quits.
 
-use qui::wl::{self, Cx, Spec, Waker};
+use qui::window::{self, Cx, Spec, Waker};
 use qui::{Align, Color, Key, Rect, Ui, id};
 
 struct Demo {
@@ -28,7 +28,7 @@ impl Demo {
     }
 }
 
-impl wl::App for Demo {
+impl window::App for Demo {
     fn start(&mut self, cx: &mut Cx) {
         cx.show = Some(Self::spec());
     }
@@ -71,7 +71,7 @@ impl wl::App for Demo {
 }
 
 fn main() {
-    if let Err(e) = wl::run(|waker| Demo { text: String::new(), waker, shown: 1 }) {
+    if let Err(e) = window::run(|waker| Demo { text: String::new(), waker, shown: 1 }) {
         eprintln!("{e}");
         std::process::exit(1);
     }

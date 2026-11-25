@@ -1,7 +1,8 @@
 # qui
 
 A small immediate-mode GUI toolkit on ash (Vulkan) and its own Wayland client
-(windows and layer-shell overlays), with its own TrueType rasterizer. It is
+(windows and layer-shell overlays), or X11 where there is no Wayland, with its own
+TrueType rasterizer. It is
 event-driven: the UI is rebuilt after each input or app event, and a frame is only
 rendered when the quads changed.
 
@@ -33,7 +34,10 @@ rendered when the quads changed.
   from before the surface was hidden.
 * `ui.rs`: immediate-mode widgets (buttons, text fields with IME and paste,
   checkboxes, scrolling, clipping), rebuilt on every event.
-* `wl.rs`: the windowing, a native Wayland client on `wayland-client` (libwayland
+* `window/`: the windowing. `mod.rs` holds what the backends share: the API
+  (`App`, `Spec`, `Cx`, `run`), the frame building and drawing, key translation
+  and paste handling. `run` picks a backend.
+* `window/wayland.rs`: a native Wayland client on `wayland-client` (libwayland
   and libxkbcommon are opened at run time). One `poll` over the Wayland socket, a
   wake-up eventfd and the key-repeat timerfd. It shows a normal window (with
   server-side decorations through `xdg-decoration` where offered) or a layer-shell
@@ -41,12 +45,22 @@ rendered when the quads changed.
   clipboard and file drops (read in a thread, only on a paste or a drop). Input or
   an app event rebuilds the UI, which takes microseconds for a few hundred quads. A
   frame is rendered only when the quads changed.
+* `window/x11.rs`: the same apps on X11 (the `x11` feature, on by default), used when
+  there is a `DISPLAY` but no Wayland; `QUI_BACKEND=x11` or `wayland` forces one.
+  It is an x11rb client of libxcb (opened at run time), with xkbcommon-x11 for the
+  keyboard and `VK_KHR_xcb_surface`. A layer-shell spec becomes an override-redirect
+  window placed by its anchors and margins on the monitor under the pointer; with
+  an exclusive keyboard it grabs the keyboard and pointer, so clicks elsewhere are
+  clicks outside. The scale is `Xft.dpi` / 96. Hiding a `keep_when_hidden` window
+  unmaps it and keeps its swapchain. The clipboard (with INCR for large data),
+  XDND file drops and themed cursors work; exclusive zones, blur and input
+  methods don't.
 
 ## Building and testing
 
 ```sh
 cargo test                                   # rasterizer: exact coverage of a square and a half-pixel edge, plus a real system font
-cargo run --example layer --features png     # demo as a layer-shell overlay
+cargo run --example layer --features png     # demo as a layer-shell overlay (--window: a normal window)
 shaders/build.sh                             # only after editing a shader: regenerates the committed SPIR-V
 ```
 

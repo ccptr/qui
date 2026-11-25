@@ -1,12 +1,5 @@
-//! qui's windowing: a native Wayland client. It shows one surface at a
-//! time, either a layer-shell overlay (launchers, panels) or a normal
-//! window (an `xdg_toplevel`, with server-side decorations where the
-//! compositor offers them).
-//!
-//! The app decides when its surface exists: [`Cx::show`] creates (or
-//! updates) it and [`Cx::hide`] destroys it, freeing the swapchain; the
-//! Vulkan device, the glyph and image atlases and the app's state live on,
-//! so showing again is quick.
+//! The Wayland backend: a native client. A toplevel is an `xdg_toplevel`,
+//! with server-side decorations where the compositor offers them.
 //!
 //! A layer surface's scale comes from the compositor, which tells the
 //! layer surface itself (not its subsurface) as soon as it has an output:
@@ -38,13 +31,12 @@
 //! ([`Waker`], usable from any thread) and the key-repeat timer; nothing
 //! else wakes it.
 
-use crate::clipboard::{IMAGE_EXTENSIONS, Pasted, image_mime, uri_paths};
-use crate::gfx::{Batch, Gfx, Quad};
-use crate::input::{Button, Cursor, Event, Key, KeyEvent, Mods, Named};
-use crate::ui::{Theme, Ui};
-use std::ffi::{CString, c_char, c_void};
+use crate::clipboard::{Pasted, uri_paths};
+use crate::gfx::Gfx;
+use crate::input::{Button, Cursor, Event, KeyEvent, Mods};
+use super::{App, Blur, Cx, Fetched, Keyboard, Layer, Painter, PastePlan, Spec, Waker, Xkb, stat, text_mime, uri_list};
+use std::ffi::c_void;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
@@ -66,275 +58,23 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use xkbcommon_dl as xkb;
 
-// ---- public API -----------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Layer {
-    Background,
-    Bottom,
-    Top,
-    #[default]
-    Overlay,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Keyboard {
-    None,
-    /// The surface keeps the keyboard while it exists.
-    Exclusive,
-    /// Focus like a normal window (usually given when shown).
-    #[default]
-    OnDemand,
-}
-
-/// A blurred area behind the content (`ext-background-effect-v1`), in
-/// content coordinates; rounded corners are approximated with steps.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Blur {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-    pub radius: f32,
-}
-
-/// What surface to show and how.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Spec {
-    /// A layer-shell overlay, or (false, or without layer-shell) a toplevel.
-    pub layer_shell: bool,
-    pub layer: Layer,
-    /// Anchored edges: top, right, bottom, left. Anchored on two opposite
-    /// edges, the catch-all area spans the output on that axis; otherwise
-    /// it is the content's size.
-    pub anchor: [bool; 4],
-    /// top, right, bottom, left.
-    pub margin: [i32; 4],
-    pub exclusive_zone: i32,
-    pub keyboard: Keyboard,
-    pub namespace: String,
-    /// The content's size in logical pixels.
-    pub width: u32,
-    pub height: u32,
-    /// The content is drawn over a transparent background.
-    pub transparent: bool,
-    pub blur: Option<Blur>,
-    /// Toplevel title and app id.
-    pub title: String,
-    pub app_id: String,
-    /// A toplevel the user can resize (the content size is then the
-    /// initial size).
-    pub resizable: bool,
-    /// The smallest size of a resizable toplevel.
-    pub min_size: (u32, u32),
-    /// Park the surface when hidden instead of destroying it, so showing
-    /// it again is immediate (layer surfaces only; costs the swapchain's
-    /// memory while hidden). See the module docs.
-    pub keep_when_hidden: bool,
-}
-
-impl Spec {
-    /// A normal, resizable window.
-    pub fn window(title: &str, app_id: &str, width: u32, height: u32) -> Spec {
-        Spec {
-            layer_shell: false,
-            transparent: false,
-            title: title.into(),
-            app_id: app_id.into(),
-            width,
-            height,
-            resizable: true,
-            ..Spec::default()
-        }
-    }
-}
-
-impl Default for Spec {
-    fn default() -> Self {
-        Spec {
-            layer_shell: true,
-            layer: Layer::Overlay,
-            anchor: [true; 4],
-            margin: [0; 4],
-            exclusive_zone: -1,
-            keyboard: Keyboard::OnDemand,
-            namespace: "qui".into(),
-            width: 600,
-            height: 400,
-            transparent: true,
-            blur: None,
-            title: String::new(),
-            app_id: "qui".into(),
-            resizable: false,
-            min_size: (0, 0),
-            keep_when_hidden: false,
-        }
-    }
-}
-
-/// Requests from the app to the runner.
-#[derive(Default)]
-pub struct Cx {
-    /// Create the surface, or update it (size, layer, ...) if it exists.
-    pub show: Option<Spec>,
-    pub hide: bool,
-    /// With [`Cx::hide`]: also release the Vulkan device and the atlases'
-    /// GPU copies, so a hidden app holds no GPU memory. Showing again then
-    /// creates the device anew (tens of milliseconds).
-    pub release_gpu: bool,
-    /// Create the surface parked (hidden, its swapchain ready at the right
-    /// scale), so a later [`Cx::show`] of the same kind is instant. Needs a
-    /// layer-shell spec with [`Spec::keep_when_hidden`]; ignored while a
-    /// surface exists.
-    pub prepare: Option<Spec>,
-    pub exit: bool,
-    /// Build once more (state changed during the build).
-    pub again: bool,
-    /// Put this text on the clipboard.
-    pub copy: Option<String>,
-    /// Read everything the clipboard holds, for [`App::pasted`] (what
-    /// Ctrl+V does outside a text field).
-    pub paste: bool,
-    visible: bool,
-    scale: f32,
-}
-
-impl Cx {
-    pub fn visible(&self) -> bool {
-        self.visible
-    }
-
-    /// The surface's scale (parked ones too), or 1 without a surface.
-    pub fn scale(&self) -> f32 {
-        self.scale
-    }
-}
-
-pub trait App: 'static {
-    /// Called once before the loop starts (e.g. to show the surface).
-    fn start(&mut self, _cx: &mut Cx) {}
-
-    /// Builds the whole UI for this frame (only while shown).
-    fn build(&mut self, ui: &mut Ui, cx: &mut Cx);
-
-    /// The [`Waker`] was woken (coalesced). Return whether to rebuild.
-    fn woken(&mut self, cx: &mut Cx) -> bool;
-
-    /// The surface gained or lost keyboard focus.
-    fn focus(&mut self, _focused: bool, _cx: &mut Cx) {}
-
-    /// A click on the transparent area around the content.
-    fn clicked_outside(&mut self, _cx: &mut Cx) {}
-
-    /// The compositor closed the surface, or the user closed the window
-    /// (it is gone already). Exits by default.
-    fn closed(&mut self, cx: &mut Cx) {
-        cx.exit = true;
-    }
-
-    /// Files were dropped onto the window.
-    fn dropped(&mut self, _path: PathBuf) {}
-
-    /// Ctrl+V outside a text field (or [`Cx::paste`]): everything the
-    /// clipboard held, possibly nothing.
-    fn pasted(&mut self, _content: Pasted) {}
-
-    /// Reading the clipboard failed.
-    fn clipboard_error(&mut self, _error: String) {}
-
-    /// The theme the UI starts with: the desktop's light or dark preference.
-    fn theme(&self) -> Theme {
-        system_theme()
-    }
-}
-
-/// [`Theme::LIGHT`] if the desktop prefers light (GNOME's `color-scheme`
-/// setting, as the settings portal reports it), else [`Theme::DARK`].
-pub fn system_theme() -> Theme {
-    let out = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
-        .stderr(std::process::Stdio::null())
-        .output();
-    match out {
-        Ok(out) if String::from_utf8_lossy(&out.stdout).contains("prefer-light") => Theme::LIGHT,
-        _ => Theme::DARK,
-    }
-}
-
-/// Wakes the loop from any thread; [`App::woken`] runs on the UI thread.
-#[derive(Clone)]
-pub struct Waker(Arc<OwnedFd>);
-
-impl Waker {
-    pub fn wake(&self) {
-        let one: u64 = 1;
-        unsafe { libc::write(self.0.as_raw_fd(), (&one as *const u64).cast(), 8) };
-    }
-}
-
-/// An XKB keysym by name ("Return", "Page_Down", "a"), as in GTK key
-/// names; 0 if unknown or without libxkbcommon.
-pub fn keysym_from_name(name: &str) -> u32 {
-    let (Some(x), Ok(c)) = (xkb::xkbcommon_option(), CString::new(name)) else {
-        return 0;
-    };
-    let sym = unsafe { (x.xkb_keysym_from_name)(c.as_ptr(), xkb::xkb_keysym_flags::XKB_KEYSYM_NO_FLAGS) };
-    if sym != 0 {
-        return sym;
-    }
-    unsafe { (x.xkb_keysym_from_name)(c.as_ptr(), xkb::xkb_keysym_flags::XKB_KEYSYM_CASE_INSENSITIVE) }
-}
-
-/// The lowercase keysym of a letter keysym (others unchanged).
-pub fn keysym_to_lower(sym: u32) -> u32 {
-    match sym {
-        0x41..=0x5a => sym + 0x20,
-        0xc0..=0xde if sym != 0xd7 => sym + 0x20,
-        0x0100_0000.. => char::from_u32(sym - 0x0100_0000)
-            .and_then(|c| c.to_lowercase().next())
-            .map_or(sym, |c| 0x0100_0000 + c as u32),
-        _ => sym,
-    }
-}
-
-/// Runs until [`Cx::exit`].
-pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
-    let conn = Connection::connect_to_env().map_err(|e| format!("Cannot connect to Wayland: {e}"))?;
+pub(super) fn run<A: App>(conn: Connection, make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     let (globals, mut queue) =
         registry_queue_init::<State>(&conn).map_err(|e| format!("Wayland registry: {e}"))?;
     let qh = queue.handle();
     let mut state = State::new(&globals, &qh)?;
     queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
 
-    let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if wake_fd < 0 {
-        return Err("eventfd failed".into());
-    }
-    let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(wake_fd) });
+    let wake = Waker::new()?;
     let timer_fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) };
     if timer_fd < 0 {
         return Err("timerfd failed".into());
     }
     state.timer = Some(unsafe { OwnedFd::from_raw_fd(timer_fd) });
-    state.waker = Some(Waker(wake.clone()));
+    state.waker = Some(wake.clone());
 
-    let app = make(Waker(wake.clone()));
-    let mut runner = Runner {
-        app,
-        conn: conn.clone(),
-        qh: qh.clone(),
-        ui: None,
-        gfx: None,
-        quads: Vec::new(),
-        batches: Vec::new(),
-        cursor: Cursor::Default,
-        dirty: false,
-        stats: std::env::var_os("QUI_STATS").is_some() || std::env::var_os("RLS_STATS").is_some(),
-        trace: std::env::var_os("QUI_EVENTS").is_some() || std::env::var_os("RLS_EVENTS").is_some(),
-        started: std::time::Instant::now(),
-        frames: 0,
-        shown_at: None,
-    };
+    let app = make(wake.clone());
+    let mut runner = Runner { app, conn: conn.clone(), qh: qh.clone(), p: Painter::new() };
     let mut cx = Cx::default();
     runner.app.start(&mut cx);
     if runner.apply(&mut state, cx)? {
@@ -352,7 +92,7 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
         let timer = state.timer.as_ref().map_or(-1, |t| t.as_raw_fd());
         let mut fds = [
             libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake.0.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 },
         ];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
@@ -371,8 +111,7 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
             drop(guard);
         }
         if fds[1].revents != 0 {
-            let mut v = 0u64;
-            unsafe { libc::read(wake.as_raw_fd(), (&mut v as *mut u64).cast(), 8) };
+            wake.drain();
             state.woken = true;
         }
         if fds[2].revents != 0 {
@@ -387,39 +126,11 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     }
 }
 
-// ---- the runner -------------------------------------------------------------------
-
-/// QUI_STATS: a line stamped with the monotonic clock, in ms (comparable
-/// across processes, e.g. with the time a client sent a request).
-fn stat(msg: std::fmt::Arguments) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("QUI_STATS").is_some() || std::env::var_os("RLS_STATS").is_some()) {
-        return;
-    }
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let ms = ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6;
-    eprintln!("qui: [{ms:.1}] {msg}");
-}
-
 struct Runner<A: App> {
     app: A,
     conn: Connection,
     qh: QueueHandle<State>,
-    ui: Option<Ui>,
-    gfx: Option<Gfx>,
-    quads: Vec<Quad>,
-    batches: Vec<Batch>,
-    cursor: Cursor,
-    /// A frame is built but not yet presented.
-    dirty: bool,
-    stats: bool,
-    /// QUI_EVENTS: log every input event.
-    trace: bool,
-    started: std::time::Instant,
-    frames: u64,
-    /// When the surface was last created (for QUI_STATS).
-    shown_at: Option<std::time::Instant>,
+    p: Painter,
 }
 
 impl<A: App> Runner<A> {
@@ -433,21 +144,10 @@ impl<A: App> Runner<A> {
         let fetched = std::mem::take(&mut *state.fetched.lock().unwrap());
         for f in fetched {
             rebuild = true;
-            match f {
-                Fetched::Field(text) => {
-                    if let Some(ui) = &mut self.ui {
-                        ui.paste(&text);
-                    }
-                }
-                Fetched::Pasted(content) => self.app.pasted(content),
-                Fetched::Dropped(paths) => {
-                    state.finish_drop();
-                    for path in paths {
-                        self.app.dropped(path);
-                    }
-                }
-                Fetched::Error(e) => self.app.clipboard_error(e),
+            if matches!(f, Fetched::Dropped(_)) {
+                state.finish_drop();
             }
+            self.p.fetched(&mut self.app, f);
         }
         if std::mem::take(&mut state.woken) && self.app.woken(&mut cx) {
             rebuild = true;
@@ -466,22 +166,12 @@ impl<A: App> Runner<A> {
         }
 
         let events = std::mem::take(&mut state.events);
-        if self.trace {
-            for e in &events {
-                eprintln!("qui: {:>8} ms {e:?}", self.started.elapsed().as_millis());
-            }
-        }
-        if let Some(ui) = &mut self.ui {
-            for e in &events {
-                rebuild |= ui.event(e);
-            }
-            if std::mem::take(&mut ui.paste_key) {
-                if ui.focus.is_some() {
-                    state.paste_field();
-                } else {
-                    state.paste_all();
-                }
-            }
+        let (changed, paste) = self.p.events(&events);
+        rebuild |= changed;
+        match paste {
+            Some(true) => state.paste_field(),
+            Some(false) => state.paste_all(),
+            None => {}
         }
         // A new or resized surface: (re)attach the swapchain.
         if let Some(s) = &mut state.surface
@@ -492,18 +182,18 @@ impl<A: App> Runner<A> {
             let (pw, ph) = s.physical();
             let display = self.conn.backend().display_ptr() as *mut c_void;
             let surface = s.content.id().as_ptr() as *mut c_void;
-            match &mut self.gfx {
+            match &mut self.p.gfx {
                 Some(gfx) if s.fresh => unsafe { gfx.attach(display, surface, (pw, ph))? },
                 Some(gfx) => gfx.resize(pw, ph),
                 None => {
                     let gfx = unsafe { Gfx::wayland(display, surface, (pw, ph), s.spec.transparent) }?;
-                    if self.stats {
+                    if self.p.stats {
                         eprintln!("qui: rendering on {}", gfx.device_name);
                     }
-                    self.gfx = Some(gfx);
+                    self.p.gfx = Some(gfx);
                 }
             }
-            if let Some(gfx) = &mut self.gfx {
+            if let Some(gfx) = &mut self.p.gfx {
                 gfx.set_mailbox(s.spec.keep_when_hidden && matches!(s.role, Role::Layer { .. }));
                 if s.parked {
                     // Prepared: the swapchain now, the first frame on show.
@@ -512,9 +202,7 @@ impl<A: App> Runner<A> {
             }
             s.fresh = false;
             stat(format_args!("swapchain attached"));
-            if self.ui.is_none() {
-                self.ui = Some(Ui::new(self.app.theme())?);
-            }
+            self.p.ensure_ui(&self.app)?;
             force = true;
         }
         // A configure to answer: draw (if it needs a frame), then commit the
@@ -526,10 +214,10 @@ impl<A: App> Runner<A> {
         // A parked surface is never drawn.
         let parked = state.surface.as_ref().is_some_and(|s| s.parked);
         if !parked && (force || rebuild || cx.again) && self.build(state, &mut cx, force) {
-            self.dirty = true;
+            self.p.dirty = true;
             stat(format_args!("built"));
         }
-        if self.dirty && !parked {
+        if self.p.dirty && !parked {
             self.draw(state)?;
         }
         if map {
@@ -540,52 +228,20 @@ impl<A: App> Runner<A> {
 
     /// Builds the UI; returns whether the output changed.
     fn build(&mut self, state: &mut State, cx: &mut Cx, force: bool) -> bool {
-        let (Some(ui), Some(s)) = (&mut self.ui, &state.surface) else { return false };
+        let Some(s) = &state.surface else { return false };
         let Some((w, h)) = s.size else { return false };
-        let scale = s.scale();
-        let mut changed = force;
-        for _ in 0..4 {
-            cx.again = false;
-            ui.begin(w as f32, h as f32, scale);
-            self.app.build(ui, cx);
-            let Some((quads, batches)) = ui.finish() else { continue };
-            if quads != self.quads.as_slice() || batches != self.batches.as_slice() {
-                self.quads.clear();
-                self.quads.extend_from_slice(quads);
-                self.batches.clear();
-                self.batches.extend_from_slice(batches);
-                changed = true;
-            }
-            if !cx.again {
-                break;
-            }
-        }
-        if ui.cursor != self.cursor || std::mem::take(&mut state.cursor_dirty) {
-            self.cursor = ui.cursor;
-            state.set_cursor(self.cursor);
+        let changed = self.p.build(&mut self.app, cx, (w as f32, h as f32), s.scale(), force);
+        if let Some(cursor) = self.p.cursor_change(&mut state.cursor_dirty) {
+            state.set_cursor(cursor);
         }
         changed
     }
 
     fn draw(&mut self, state: &State) -> Result<(), String> {
-        let (Some(gfx), Some(ui), Some(s)) = (&mut self.gfx, &mut self.ui, &state.surface) else {
-            return Ok(());
-        };
-        if s.size.is_none() {
-            return Ok(());
+        match &state.surface {
+            Some(s) if s.size.is_some() => self.p.draw(s.spec.transparent),
+            _ => Ok(()),
         }
-        let clear = if s.spec.transparent { [0.0; 4] } else { ui.theme.bg.floats() };
-        if gfx.draw(&self.quads, &self.batches, clear, &mut ui.text, &mut ui.images)? {
-            self.dirty = false;
-            self.frames += 1;
-            if self.stats {
-                stat(format_args!("frame {} presented", self.frames));
-                if let Some(at) = self.shown_at.take() {
-                    eprintln!("qui: shown in {:.1} ms", at.elapsed().as_secs_f64() * 1000.0);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Applies the app's requests. Returns true to exit.
@@ -601,7 +257,7 @@ impl<A: App> Runner<A> {
             let _ = self.conn.flush();
             return Ok(true);
         }
-        let mailbox = self.gfx.as_ref().is_some_and(Gfx::is_mailbox);
+        let mailbox = self.p.gfx.as_ref().is_some_and(Gfx::is_mailbox);
         if cx.hide && state.visible() {
             let park = !cx.release_gpu
                 && mailbox
@@ -611,14 +267,14 @@ impl<A: App> Runner<A> {
                     .is_some_and(|s| s.spec.keep_when_hidden && matches!(s.role, Role::Layer { .. }));
             if park {
                 state.park();
-                self.dirty = false;
+                self.p.dirty = false;
             } else {
                 self.teardown(state);
             }
         }
         if cx.release_gpu && !state.visible() {
             self.teardown(state);
-            self.release_gpu();
+            self.p.release_gpu();
         }
         if let Some(spec) = cx.prepare
             && state.surface.is_none()
@@ -628,7 +284,7 @@ impl<A: App> Runner<A> {
         }
         if let Some(spec) = cx.show {
             if !state.visible() {
-                self.shown_at = Some(std::time::Instant::now());
+                self.p.shown_at = Some(std::time::Instant::now());
                 stat(format_args!("show"));
             }
             state.show(spec, &self.qh, mailbox)?;
@@ -636,26 +292,9 @@ impl<A: App> Runner<A> {
         Ok(false)
     }
 
-    /// Drops the Vulkan device. The glyph atlas is uploaded whole to the
-    /// next one; images are decoded again by the app as it draws them.
-    fn release_gpu(&mut self) {
-        self.gfx = None;
-        if let Some(ui) = &mut self.ui {
-            ui.text.dirty = Some([0, 0, crate::text::ATLAS, crate::text::ATLAS]);
-            ui.images.clear();
-        }
-        // Return the driver's freed heap to the system.
-        unsafe { libc::malloc_trim(0) };
-    }
-
     fn teardown(&mut self, state: &mut State) {
-        if let Some(gfx) = &mut self.gfx {
-            gfx.detach();
-        }
+        self.p.detach();
         state.destroy_surface();
-        self.quads.clear();
-        self.batches.clear();
-        self.dirty = false;
     }
 }
 
@@ -730,11 +369,6 @@ impl Surface {
     }
 }
 
-struct Xkb {
-    keymap: *mut xkb::xkb_keymap,
-    state: *mut xkb::xkb_state,
-}
-
 struct State {
     qh: QueueHandle<State>,
     compositor: wl_compositor::WlCompositor,
@@ -792,14 +426,6 @@ struct State {
     dropped: Option<wl_data_offer::WlDataOffer>,
     /// Clipboard and drop reads finished by threads.
     fetched: Arc<Mutex<Vec<Fetched>>>,
-}
-
-/// The result of reading a clipboard or drop offer.
-enum Fetched {
-    Field(String),
-    Pasted(Pasted),
-    Dropped(Vec<PathBuf>),
-    Error(String),
 }
 
 impl State {
@@ -1196,11 +822,9 @@ impl State {
             self.woken = true;
             return;
         };
-        let files = mimes.iter().any(|m| m == "text/uri-list");
-        let image = IMAGE_EXTENSIONS.into_iter().find(|&ext| mimes.iter().any(|m| m == image_mime(ext)));
-        let text = text_mime(mimes);
+        let plan = PastePlan::new(mimes);
         let mut reads = Vec::new();
-        for mime in [files.then_some("text/uri-list"), image.map(image_mime), text].into_iter().flatten() {
+        for mime in plan.mimes() {
             match receive(offer, mime) {
                 Some(fd) => reads.push(fd),
                 None => {
@@ -1210,29 +834,7 @@ impl State {
                 }
             }
         }
-        self.fetch(reads, move |data| {
-            let mut data = data.into_iter();
-            let uris: Vec<String> = if files {
-                String::from_utf8_lossy(&data.next().unwrap_or_default())
-                    .lines()
-                    .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-                    .map(str::to_string)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let image = image.and_then(|ext| {
-                let bytes = data.next().unwrap_or_default();
-                (!bytes.is_empty()).then_some((bytes, ext))
-            });
-            let text = text.and_then(|_| {
-                let t = String::from_utf8_lossy(&data.next().unwrap_or_default()).into_owned();
-                (!t.trim().is_empty()).then_some(t)
-            });
-            let mut pasted = Pasted { files: uri_paths(&uris), image, text };
-            pasted.drop_repeats(&uris);
-            Fetched::Pasted(pasted)
-        });
+        self.fetch(reads, move |data| Fetched::Pasted(plan.assemble(data)));
     }
 
     /// Reads the pipes in a thread, then hands `done` their contents.
@@ -1284,40 +886,7 @@ impl State {
             }
             return;
         }
-        let (Some(x), Some(k)) = (xkb::xkbcommon_option(), &self.xkb) else { return };
-        let sym = unsafe { (x.xkb_state_key_get_one_sym)(k.state, code) };
-        let mut buf = [0 as c_char; 64];
-        let n = unsafe { (x.xkb_state_key_get_utf8)(k.state, code, buf.as_mut_ptr(), buf.len()) };
-        let text = (n > 0)
-            .then(|| {
-                let bytes: Vec<u8> = buf[..(n as usize).min(63)].iter().map(|&b| b as u8).collect();
-                String::from_utf8(bytes).ok()
-            })
-            .flatten()
-            .filter(|t| !t.chars().any(char::is_control));
-        let base = {
-            let mut syms: *const xkb::xkb_keysym_t = std::ptr::null();
-            let n = unsafe { (x.xkb_keymap_key_get_syms_by_level)(k.keymap, code, 0, 0, &mut syms) };
-            (n > 0)
-                .then(|| char::from_u32(unsafe { (x.xkb_keysym_to_utf32)(*syms) }))
-                .flatten()
-                .filter(|c| *c != '\0')
-        };
-        let event = KeyEvent {
-            key: named(sym).map(Key::Named).unwrap_or_else(|| {
-                match char::from_u32(unsafe { (x.xkb_keysym_to_utf32)(sym) }) {
-                    Some(c) if c != '\0' && !c.is_control() => Key::Char(c),
-                    _ => Key::Other,
-                }
-            }),
-            text,
-            keysym: sym,
-            base,
-            code: key,
-            repeat: false,
-            mods: self.mods(),
-        };
-        let repeats = unsafe { (x.xkb_keymap_key_repeats)(k.keymap, code) } != 0;
+        let Some((event, repeats)) = self.xkb.as_ref().and_then(|k| k.key(code)) else { return };
         if repeats {
             self.repeating = Some((code, event.clone()));
             self.arm_repeat();
@@ -1329,20 +898,7 @@ impl State {
     }
 
     fn mods(&self) -> Mods {
-        let (Some(x), Some(k)) = (xkb::xkbcommon_option(), &self.xkb) else { return Mods::NONE };
-        let active = |name: &[u8]| unsafe {
-            (x.xkb_state_mod_name_is_active)(
-                k.state,
-                name.as_ptr().cast(),
-                xkb::xkb_state_component::XKB_STATE_MODS_EFFECTIVE,
-            ) > 0
-        };
-        Mods {
-            ctrl: active(xkb::XKB_MOD_NAME_CTRL),
-            shift: active(xkb::XKB_MOD_NAME_SHIFT),
-            alt: active(xkb::XKB_MOD_NAME_ALT),
-            logo: active(xkb::XKB_MOD_NAME_LOGO),
-        }
+        self.xkb.as_ref().map_or(Mods::NONE, Xkb::mods)
     }
 }
 
@@ -1407,13 +963,6 @@ fn add_rounded(region: &wl_region::WlRegion, b: Blur) {
     }
 }
 
-/// The best plain-text MIME type offered.
-fn text_mime(mimes: &[String]) -> Option<&'static str> {
-    ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"]
-        .into_iter()
-        .find(|m| mimes.iter().any(|x| x == m))
-}
-
 /// Asks the offer's owner to write `mime` into a pipe; returns its read end.
 fn receive(offer: &wl_data_offer::WlDataOffer, mime: &str) -> Option<OwnedFd> {
     let mut fds = [0 as RawFd; 2];
@@ -1443,29 +992,6 @@ fn transparent_buffer(state: &State, qh: &QueueHandle<State>) -> Option<wl_buffe
     let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, qh, ());
     pool.destroy();
     Some(buffer)
-}
-
-/// The named key for a keysym.
-fn named(sym: u32) -> Option<Named> {
-    Some(match sym {
-        0xff08 => Named::Backspace,
-        0xff09 | 0xfe20 => Named::Tab,
-        0xff0d | 0xff8d => Named::Enter,
-        0xff1b => Named::Escape,
-        0xffff | 0xff9f => Named::Delete,
-        0xff50 | 0xff95 => Named::Home,
-        0xff51 | 0xff96 => Named::Left,
-        0xff52 | 0xff97 => Named::Up,
-        0xff53 | 0xff98 => Named::Right,
-        0xff54 | 0xff99 => Named::Down,
-        0xff55 | 0xff9a => Named::PageUp,
-        0xff56 | 0xff9b => Named::PageDown,
-        0xff57 | 0xff9c => Named::End,
-        0xff63 | 0xff9e => Named::Insert,
-        0x1008ff6d => Named::Paste,
-        0xffbe..=0xffe0 => Named::F((sym - 0xffbe + 1) as u8),
-        _ => return None,
-    })
 }
 
 // ---- protocol events ----------------------------------------------------------------
@@ -1722,12 +1248,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     return;
                 }
                 let xstate = unsafe { (x.xkb_state_new)(keymap) };
-                if let Some(old) = state.xkb.take() {
-                    unsafe {
-                        (x.xkb_state_unref)(old.state);
-                        (x.xkb_keymap_unref)(old.keymap);
-                    }
-                }
                 state.xkb = Some(Xkb { keymap, state: xstate });
             }
             wl_keyboard::Event::Enter { serial, .. } => {
@@ -1859,14 +1379,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                     return;
                 }
                 if let Some(read) = receive(&offer, "text/uri-list") {
-                    state.fetch(vec![read], |mut data| {
-                        let uris: Vec<String> = String::from_utf8_lossy(&data.remove(0))
-                            .lines()
-                            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        Fetched::Dropped(uri_paths(&uris))
-                    });
+                    state.fetch(vec![read], |mut data| Fetched::Dropped(uri_paths(&uri_list(&data.remove(0)))));
                 }
                 state.dropped = Some(offer);
             }
@@ -1917,14 +1430,6 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for State {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lowercase_keysyms() {
-        assert_eq!(keysym_to_lower(0x41), 0x61);
-        assert_eq!(keysym_to_lower(0x61), 0x61);
-        assert_eq!(keysym_to_lower(0xff0d), 0xff0d);
-        assert_eq!(keysym_to_lower(0x0100_0000 + 'Ж' as u32), 0x0100_0000 + 'ж' as u32);
-    }
 
     #[test]
     fn layer_size_stretches_doubly_anchored_axes() {

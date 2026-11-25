@@ -1,5 +1,5 @@
 //! Input events as [`crate::Ui`] receives them from the windowing
-//! ([`crate::wl`]).
+//! ([`crate::window`]).
 
 /// Keyboard modifiers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

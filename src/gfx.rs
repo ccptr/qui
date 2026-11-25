@@ -102,6 +102,8 @@ pub struct Gfx {
     /// Use MAILBOX where the surface offers it (see [`Gfx::set_mailbox`]).
     want_mailbox: bool,
     present_mode: vk::PresentModeKHR,
+    /// The kind of window the instance makes surfaces for.
+    native: Native,
     pub device_name: String,
 }
 
@@ -122,10 +124,18 @@ impl Gfx {
         size: (u32, u32),
         transparent: bool,
     ) -> Result<Gfx, String> {
-        if display.is_null() || surface.is_null() {
-            return Err("null Wayland handle".into());
-        }
-        unsafe { Self::create(display, surface, size, transparent) }
+        unsafe { Self::new(Native::Wayland { display, surface }, size, transparent) }
+    }
+
+    /// Renders into a native window (see [`Gfx::wayland`]). The instance
+    /// is made for that kind of window: later windows must be the same kind.
+    ///
+    /// # Safety
+    /// The handles must be live and outlive the swapchain (until
+    /// [`Gfx::detach`] or drop).
+    pub unsafe fn new(native: Native, size: (u32, u32), transparent: bool) -> Result<Gfx, String> {
+        native.check()?;
+        unsafe { Self::create(native, size, transparent) }
     }
 
     /// Destroys the swapchain and the Vulkan surface, keeping the device.
@@ -155,8 +165,21 @@ impl Gfx {
         surface: *mut std::ffi::c_void,
         size: (u32, u32),
     ) -> Result<(), String> {
+        unsafe { self.attach_native(Native::Wayland { display, surface }, size) }
+    }
+
+    /// Renders into a new native window after [`Gfx::detach`]; it must be
+    /// the kind the device was made for.
+    ///
+    /// # Safety
+    /// As for [`Gfx::new`].
+    pub unsafe fn attach_native(&mut self, native: Native, size: (u32, u32)) -> Result<(), String> {
+        native.check()?;
+        if std::mem::discriminant(&native) != std::mem::discriminant(&self.native) {
+            return Err("The Vulkan device was made for another kind of window".into());
+        }
         self.detach();
-        let surface = unsafe { create_surface(&self._entry, &self.instance, display, surface) }?;
+        let surface = unsafe { create_surface(&self._entry, &self.instance, native) }?;
         let ok = unsafe { self.surface_fn.get_physical_device_surface_support(self.pdev, self.family, surface) }
             .unwrap_or(false);
         if !ok {
@@ -169,17 +192,11 @@ impl Gfx {
         Ok(())
     }
 
-    unsafe fn create(
-        display: *mut std::ffi::c_void,
-        wl_surface: *mut std::ffi::c_void,
-        size: (u32, u32),
-        transparent: bool,
-    ) -> Result<Gfx, String> {
+    unsafe fn create(native: Native, size: (u32, u32), transparent: bool) -> Result<Gfx, String> {
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| format!("Vulkan is not available ({e})"))?;
 
-        let extensions: Vec<*const c_char> =
-            vec![ash::khr::surface::NAME.as_ptr(), ash::khr::wayland_surface::NAME.as_ptr()];
+        let extensions: Vec<*const c_char> = vec![ash::khr::surface::NAME.as_ptr(), native.extension().as_ptr()];
         let flags = vk::InstanceCreateFlags::empty();
         let mut layers: Vec<*const c_char> = Vec::new();
         if std::env::var_os("RLS_VK_VALIDATE").is_some() {
@@ -200,7 +217,7 @@ impl Gfx {
         }
         .map_err(err("vkCreateInstance"))?;
 
-        let surface = unsafe { create_surface(&entry, &instance, display, wl_surface) }?;
+        let surface = unsafe { create_surface(&entry, &instance, native) }?;
         let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
 
         // Prefer the integrated GPU: a few hundred quads never need more,
@@ -561,6 +578,7 @@ impl Gfx {
             stale: true,
             want_mailbox: false,
             present_mode: vk::PresentModeKHR::FIFO,
+            native,
             device_name,
         };
         gfx.clear_atlas()?;
@@ -1402,18 +1420,53 @@ fn create_pipeline(
     Ok((layout, pipeline))
 }
 
-/// Creates the `VkSurfaceKHR` for a `wl_surface`.
-unsafe fn create_surface(
-    entry: &ash::Entry,
-    instance: &ash::Instance,
-    display: *mut std::ffi::c_void,
-    surface: *mut std::ffi::c_void,
-) -> Result<vk::SurfaceKHR, String> {
-    unsafe {
-        ash::khr::wayland_surface::Instance::new(entry, instance).create_wayland_surface(
-            &vk::WaylandSurfaceCreateInfoKHR::default().display(display.cast()).surface(surface.cast()),
-            None,
-        )
+/// A native window to render into.
+#[derive(Clone, Copy, Debug)]
+pub enum Native {
+    /// A `wl_display*` and a `wl_surface*`.
+    Wayland { display: *mut std::ffi::c_void, surface: *mut std::ffi::c_void },
+    /// An `xcb_connection_t*` and an X11 window.
+    Xcb { connection: *mut std::ffi::c_void, window: u32 },
+}
+
+impl Native {
+    fn check(&self) -> Result<(), String> {
+        match *self {
+            Native::Wayland { display, surface } if display.is_null() || surface.is_null() => {
+                Err("null Wayland handle".into())
+            }
+            Native::Xcb { connection, window } if connection.is_null() || window == 0 => {
+                Err("null X11 handle".into())
+            }
+            _ => Ok(()),
+        }
     }
-    .map_err(err("vkCreateWaylandSurfaceKHR"))
+
+    /// The instance extension that makes surfaces for this kind of window.
+    fn extension(&self) -> &'static std::ffi::CStr {
+        match self {
+            Native::Wayland { .. } => ash::khr::wayland_surface::NAME,
+            Native::Xcb { .. } => ash::khr::xcb_surface::NAME,
+        }
+    }
+}
+
+/// Creates the `VkSurfaceKHR` for a native window.
+unsafe fn create_surface(entry: &ash::Entry, instance: &ash::Instance, native: Native) -> Result<vk::SurfaceKHR, String> {
+    match native {
+        Native::Wayland { display, surface } => unsafe {
+            ash::khr::wayland_surface::Instance::new(entry, instance).create_wayland_surface(
+                &vk::WaylandSurfaceCreateInfoKHR::default().display(display.cast()).surface(surface.cast()),
+                None,
+            )
+        }
+        .map_err(err("vkCreateWaylandSurfaceKHR")),
+        Native::Xcb { connection, window } => unsafe {
+            ash::khr::xcb_surface::Instance::new(entry, instance).create_xcb_surface(
+                &vk::XcbSurfaceCreateInfoKHR::default().connection(connection.cast()).window(window),
+                None,
+            )
+        }
+        .map_err(err("vkCreateXcbSurfaceKHR")),
+    }
 }

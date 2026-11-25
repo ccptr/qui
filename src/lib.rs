@@ -1,4 +1,5 @@
-//! `qui`: a small immediate-mode GUI toolkit for one window, on Wayland.
+//! `qui`: a small immediate-mode GUI toolkit for one window, on Wayland
+//! (or X11).
 //!
 //! * [`font`]: TrueType parsing and rasterization (no font crates).
 //! * [`text`]: glyph cache and atlas, measuring, eliding, wrapping.
@@ -6,8 +7,9 @@
 //! * [`gfx`]: Vulkan through `ash`: one pipeline of instanced quads.
 //! * [`input`]: input events.
 //! * [`ui`]: widgets, layout helpers, input handling.
-//! * [`wl`]: the windowing: a native Wayland client showing a normal
-//!   window or a layer-shell overlay, and the event loop ([`run`]).
+//! * [`window`]: the windowing: a normal window or a layer-shell overlay,
+//!   and the event loop ([`run`]), on Wayland or (the `x11` feature, where
+//!   there is no Wayland) X11.
 //!
 //! It is event-driven: the UI is rebuilt after each input or app event,
 //! and a frame is only rendered when the resulting quads differ from the
@@ -20,9 +22,9 @@ pub mod image;
 pub mod input;
 pub mod text;
 pub mod ui;
-pub mod wl;
+pub mod window;
 
 pub use clipboard::Pasted;
 pub use input::{Cursor, Event, Key, KeyEvent, Mods, Named};
 pub use ui::{Align, ButtonStyle, Color, Edit, EditStyle, Rect, Response, Theme, Ui, id};
-pub use wl::{App, Cx, Spec, Waker, run, system_theme};
+pub use window::{App, Cx, Spec, Waker, run, system_theme};

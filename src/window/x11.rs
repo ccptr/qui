@@ -4,7 +4,7 @@
 
 use crate::gfx::{Gfx, Native};
 use crate::input::{Button, Cursor, Event, Mods};
-use super::{App, Cx, Fetched, Keyboard, Layer, Painter, PastePlan, Spec, Waker, Xkb, stat, text_mime, uri_list};
+use super::{App, Cx, Fetched, Keyboard, Layer, Painter, PastePlan, Spec, Waker, Xkb, place, stat, text_mime, uri_list};
 use crate::clipboard::{IMAGE_EXTENSIONS, image_mime, uri_paths};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
@@ -1181,43 +1181,5 @@ impl Drop for X {
         {
             unsafe { (x.xkb_context_unref)(self.xkb_ctx) };
         }
-    }
-}
-
-/// Where a layer spec's window goes on a monitor (x, y, width, height),
-/// all in physical pixels: as the layer surface would be, the content
-/// centered in its area.
-fn place(spec: &Spec, scale: f32, (w, h): (u32, u32), (mx, my, mw, mh): (i32, i32, i32, i32)) -> (i32, i32) {
-    let s = |v: i32| (v as f32 * scale).round() as i32;
-    let [top, right, bottom, left] = spec.anchor;
-    let [mt, mr, mb, ml] = spec.margin;
-    let axis = |start: i32, len: i32, size: i32, near: bool, far: bool, m_near: i32, m_far: i32| match (near, far) {
-        (true, true) => start + s(m_near) + (len - s(m_near) - s(m_far) - size) / 2,
-        (true, false) => start + s(m_near),
-        (false, true) => start + len - s(m_far) - size,
-        (false, false) => start + (len - size) / 2,
-    };
-    (axis(mx, mw, w as i32, left, right, ml, mr), axis(my, mh, h as i32, top, bottom, mt, mb))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layer_placement() {
-        let monitor = (1920, 0, 1000, 800);
-        // Anchored everywhere: centered.
-        let spec = Spec { width: 200, height: 100, ..Spec::default() };
-        assert_eq!(place(&spec, 1.0, (200, 100), monitor), (1920 + 400, 350));
-        // Top and left, with margins, at scale 2.
-        let spec = Spec { anchor: [true, false, false, true], margin: [10, 0, 0, 5], ..spec };
-        assert_eq!(place(&spec, 2.0, (400, 200), monitor), (1920 + 10, 20));
-        // Bottom only: at the bottom, centered across.
-        let spec = Spec { anchor: [false, false, true, false], margin: [0, 0, 8, 0], ..spec };
-        assert_eq!(place(&spec, 1.0, (200, 100), monitor), (1920 + 400, 800 - 8 - 100));
-        // Top and bottom with uneven margins: centered in what's left.
-        let spec = Spec { anchor: [true, false, true, false], margin: [100, 0, 0, 0], ..spec };
-        assert_eq!(place(&spec, 1.0, (200, 100), monitor).1, 100 + (700 - 100) / 2);
     }
 }

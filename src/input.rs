@@ -52,13 +52,15 @@ pub struct KeyEvent {
     pub key: Key,
     /// Text the key produces, if any (none for most named keys).
     pub text: Option<String>,
-    /// The XKB keysym, when the runner knows it (0 otherwise). Bindings
+    /// The XKB keysym, when the runner knows it (0 otherwise; on Windows,
+    /// translated from the virtual key and the character typed). Bindings
     /// written as key names ("Return", "Page_Down", "a") match on this.
     pub keysym: u32,
     /// The key's character without modifiers, for layouts with Latin
     /// letters (used to match Ctrl+V on any layout).
     pub base: Option<char>,
-    /// The Linux evdev scan code (0 if unknown).
+    /// The Linux evdev scan code (0 if unknown; on Windows, translated
+    /// from the scan code).
     pub code: u32,
     pub repeat: bool,
     /// Modifiers held when the key was pressed (they may have changed by

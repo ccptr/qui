@@ -382,9 +382,11 @@ fn color_id(font: u8, glyph: u16, w: u32) -> ImageId {
     (1 << 63) | ((font as u64) << 40) | ((glyph as u64) << 16) | (w as u64 & 0xFFFF)
 }
 
-/// Fallback font files from fontconfig, best last (they are popped).
+/// Fallback font files from fontconfig (on Windows, the system's fonts
+/// for other scripts), best last (they are popped).
 fn fallback_fonts() -> Vec<PathBuf> {
     let mut list = fc_files(&["-s", "sans-serif"]);
+    list.extend(windows_fonts(&WINDOWS_FALLBACKS));
     list.reverse();
     list
 }
@@ -393,7 +395,44 @@ fn emoji_font_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("QUI_EMOJI_FONT") {
         return Some(path.into());
     }
-    fc_files(&["emoji"]).into_iter().next()
+    // Segoe UI Emoji's colour layers (COLR) aren't supported: its emoji
+    // come out in one colour.
+    fc_files(&["emoji"]).into_iter().chain(windows_fonts(&["seguiemj.ttf"])).next()
+}
+
+/// Windows fonts covering other scripts, most preferred first: symbols,
+/// Chinese, Japanese, Korean, Indic, Thai and Southeast Asian, African,
+/// Hebrew and Arabic, historic scripts. Fonts with CFF outlines are
+/// skipped by the parser.
+const WINDOWS_FALLBACKS: [&str; 17] = [
+    "seguisym.ttf",
+    "msyh.ttc",
+    "YuGothM.ttc",
+    "malgun.ttf",
+    "Nirmala.ttc",
+    "Nirmala.ttf",
+    "LeelawUI.ttf",
+    "Ebrima.ttf",
+    "gadugi.ttf",
+    "himalaya.ttf",
+    "mmrtext.ttf",
+    "javatext.ttf",
+    "arial.ttf",
+    "tahoma.ttf",
+    "seguihis.ttf",
+    "simsun.ttc",
+    "mingliub.ttc",
+];
+
+/// Those of the named files that the Windows font folder has (nothing
+/// elsewhere).
+fn windows_fonts(names: &[&str]) -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+    let dir = PathBuf::from(windir).join("Fonts");
+    names.iter().map(|n| dir.join(n)).filter(|p| p.exists()).collect()
 }
 
 /// Font files `fc-match` lists for a pattern (nothing without fontconfig).

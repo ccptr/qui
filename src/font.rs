@@ -19,7 +19,6 @@ use std::ops::Deref;
 /// large and only a few of their pages are ever touched).
 pub enum FontData {
     Owned(Vec<u8>),
-    #[cfg(unix)]
     Mapped(memmap2::Mmap),
 }
 
@@ -28,7 +27,6 @@ impl Deref for FontData {
     fn deref(&self) -> &[u8] {
         match self {
             FontData::Owned(v) => v,
-            #[cfg(unix)]
             FontData::Mapped(m) => m,
         }
     }
@@ -100,20 +98,13 @@ impl Font {
         Self::from_data(FontData::Owned(data))
     }
 
-    /// Opens a font file, mapped into memory on Unix.
+    /// Opens a font file, mapped into memory.
     pub fn open(path: &std::path::Path) -> Option<Font> {
-        #[cfg(unix)]
-        {
-            let file = std::fs::File::open(path).ok()?;
-            // SAFETY: font files aren't modified while in use; if one is,
-            // glyphs come out wrong, the reads stay in bounds.
-            let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-            Self::from_data(FontData::Mapped(map))
-        }
-        #[cfg(not(unix))]
-        {
-            Self::parse(std::fs::read(path).ok()?)
-        }
+        let file = std::fs::File::open(path).ok()?;
+        // SAFETY: font files aren't modified while in use; if one is,
+        // glyphs come out wrong, the reads stay in bounds.
+        let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        Self::from_data(FontData::Mapped(map))
     }
 
     /// Whether glyphs of this font are colour images.

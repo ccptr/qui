@@ -71,8 +71,46 @@ impl Pasted {
     }
 }
 
+/// A BMP file of a device-independent bitmap (Windows' `CF_DIB`: a
+/// `BITMAPINFOHEADER` or a later one, the colour table or masks, the
+/// pixels), which only lacks the file header.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
+    let u32_at = |at: usize| Some(u32::from_le_bytes(dib.get(at..at + 4)?.try_into().ok()?));
+    let header = u32_at(0)? as usize;
+    if header < 40 || header > dib.len() {
+        return None;
+    }
+    let bits = u16::from_le_bytes([dib[14], dib[15]]);
+    let compression = u32_at(16)?;
+    let colors = u32_at(32)? as usize;
+    // BI_BITFIELDS and BI_ALPHABITFIELDS masks follow a 40-byte header.
+    let masks = match (header, compression) {
+        (40, 3) => 12,
+        (40, 6) => 16,
+        _ => 0,
+    };
+    let table = match colors {
+        0 if bits <= 8 => 4 << bits,
+        n => 4 * n,
+    };
+    let offset = 14 + header + masks + table;
+    let size = 14 + dib.len();
+    if offset > size {
+        return None;
+    }
+    let mut bmp = Vec::with_capacity(size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&u32::try_from(size).ok()?.to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&(offset as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    Some(bmp)
+}
+
 /// `file://` URIs from a `text/uri-list` drop as local paths. Other schemes
 /// (e.g. `https://` from a browser) and other hosts are skipped.
+#[cfg(unix)]
 pub(crate) fn uri_paths(uris: &[String]) -> Vec<PathBuf> {
     uris.iter().filter_map(|uri| uri_path(uri.trim())).collect()
 }
@@ -166,3 +204,37 @@ mod paste_tests {
     }
 }
 
+
+#[cfg(test)]
+mod bmp_tests {
+    use super::*;
+
+    #[test]
+    fn dib_file_header() {
+        // A 2×1 24-bit bitmap: a 40-byte header, then 8 bytes of pixels
+        // (rows padded to 4 bytes).
+        let mut dib = Vec::new();
+        for v in [40u32, 2, 1] {
+            dib.extend_from_slice(&v.to_le_bytes());
+        }
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&24u16.to_le_bytes());
+        dib.extend_from_slice(&[0; 24]);
+        dib.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
+        let bmp = dib_to_bmp(&dib).unwrap();
+        assert_eq!(&bmp[..2], b"BM");
+        assert_eq!(u32::from_le_bytes(bmp[2..6].try_into().unwrap()) as usize, bmp.len());
+        assert_eq!(u32::from_le_bytes(bmp[10..14].try_into().unwrap()), 54);
+        // 8-bit: a full colour table; bit fields: three masks.
+        let mut paletted = dib.clone();
+        paletted[14] = 8;
+        assert!(dib_to_bmp(&paletted).is_none(), "shorter than its colour table");
+        paletted.extend_from_slice(&[0; 1024]);
+        assert_eq!(u32::from_le_bytes(dib_to_bmp(&paletted).unwrap()[10..14].try_into().unwrap()), 54 + 1024);
+        dib[14] = 32;
+        dib[16] = 3;
+        dib.splice(40..40, [0xff; 12]);
+        assert_eq!(u32::from_le_bytes(dib_to_bmp(&dib).unwrap()[10..14].try_into().unwrap()), 54 + 12);
+        assert!(dib_to_bmp(&dib[..20]).is_none());
+    }
+}

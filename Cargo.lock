@@ -224,6 +224,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
+ "windows-sys",
  "x11rb",
  "xkbcommon-dl",
 ]

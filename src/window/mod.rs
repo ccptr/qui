@@ -44,22 +44,55 @@
 //! * A hidden window owns the clipboard, so copied text stays available
 //!   while the app is hidden. Pastes and file drops (XDND) are read
 //!   incrementally (INCR) when large.
+//!
+//! On Windows, [`run`] uses Win32 and Vulkan's `VK_KHR_win32_surface`
+//! (the `wayland` and `x11` features do nothing there). It differs from
+//! Wayland as X11 does, except:
+//!
+//! * A layer-shell [`Spec`] becomes a borderless popup kept off the
+//!   taskbar, placed by its anchors and margins in the work area (the
+//!   monitor minus the taskbar) of the monitor under the pointer, topmost
+//!   for [`Layer::Top`] and [`Layer::Overlay`]. Windows has no keyboard
+//!   grab: [`Keyboard::Exclusive`] takes the focus when shown, and losing
+//!   it (a click elsewhere, Alt+Tab) is [`App::clicked_outside`].
+//!   [`Keyboard::None`] never takes the focus.
+//! * The scale is the window's monitor DPI / 96 (per-monitor DPI aware),
+//!   and follows the window to other monitors.
+//! * Transparent specs are drawn over the theme's background (Windows'
+//!   Vulkan drivers present opaque swapchains). Toplevels get a dark title
+//!   bar under a dark theme.
+//! * Input methods work through the system's default IME window: the text
+//!   it commits arrives as typed text. Keysyms and scan codes are
+//!   translated to their XKB and evdev equivalents, so
+//!   [`keysym_from_name`] bindings work as on Linux.
+//! * The clipboard holds UTF-16 text, files (`CF_HDROP`) and images (the
+//!   `PNG` format where offered, else the bitmap as a BMP file). Files are
+//!   dropped through `WM_DROPFILES`. The app id is not used.
 
-use crate::clipboard::{IMAGE_EXTENSIONS, Pasted, image_mime, uri_paths};
+use crate::clipboard::Pasted;
+#[cfg(unix)]
+use crate::clipboard::{IMAGE_EXTENSIONS, image_mime, uri_paths};
 use crate::gfx::{Batch, Gfx, Quad};
-use crate::input::{Cursor, Event, Key, KeyEvent, Mods, Named};
+use crate::input::{Cursor, Event, Named};
+#[cfg(unix)]
+use crate::input::{Key, KeyEvent, Mods};
 use crate::ui::{Theme, Ui};
+#[cfg(unix)]
 use std::ffi::{CString, c_char};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(feature = "wayland")]
+#[cfg(all(unix, feature = "wayland"))]
 use wayland_client::Connection;
+#[cfg(unix)]
 use xkbcommon_dl as xkb;
 
-#[cfg(feature = "wayland")]
+#[cfg(all(unix, feature = "wayland"))]
 mod wayland;
-#[cfg(feature = "x11")]
+#[cfg(windows)]
+mod win32;
+#[cfg(all(unix, feature = "x11"))]
 mod x11;
 
 // ---- public API -----------------------------------------------------------------
@@ -245,7 +278,17 @@ pub trait App: 'static {
 }
 
 /// [`Theme::LIGHT`] if the desktop prefers light (GNOME's `color-scheme`
-/// setting, as the settings portal reports it), else [`Theme::DARK`].
+/// setting, as the settings portal reports it; on Windows, the apps'
+/// light or dark mode), else [`Theme::DARK`].
+#[cfg(windows)]
+pub fn system_theme() -> Theme {
+    if win32::light_theme() { Theme::LIGHT } else { Theme::DARK }
+}
+
+/// [`Theme::LIGHT`] if the desktop prefers light (GNOME's `color-scheme`
+/// setting, as the settings portal reports it; on Windows, the apps'
+/// light or dark mode), else [`Theme::DARK`].
+#[cfg(not(windows))]
 pub fn system_theme() -> Theme {
     let out = std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "color-scheme"])
@@ -259,8 +302,9 @@ pub fn system_theme() -> Theme {
 
 /// Wakes the loop from any thread; [`App::woken`] runs on the UI thread.
 #[derive(Clone)]
-pub struct Waker(pub(crate) Arc<OwnedFd>);
+pub struct Waker(#[cfg(unix)] pub(crate) Arc<OwnedFd>, #[cfg(windows)] pub(crate) Arc<win32::Wake>);
 
+#[cfg(unix)]
 impl Waker {
     pub fn wake(&self) {
         let one: u64 = 1;
@@ -283,16 +327,146 @@ impl Waker {
 }
 
 /// An XKB keysym by name ("Return", "Page_Down", "a"), as in GTK key
-/// names; 0 if unknown or without libxkbcommon.
+/// names; 0 if unknown. Without libxkbcommon (and on Windows), only the
+/// common names are known: ASCII letters and digits, `U20AC`-style code
+/// points, and the names of the named keys, modifiers and ASCII
+/// punctuation.
 pub fn keysym_from_name(name: &str) -> u32 {
-    let (Some(x), Ok(c)) = (xkb::xkbcommon_option(), CString::new(name)) else {
-        return 0;
-    };
-    let sym = unsafe { (x.xkb_keysym_from_name)(c.as_ptr(), xkb::xkb_keysym_flags::XKB_KEYSYM_NO_FLAGS) };
-    if sym != 0 {
+    #[cfg(unix)]
+    if let (Some(x), Ok(c)) = (xkb::xkbcommon_option(), CString::new(name)) {
+        let sym = unsafe { (x.xkb_keysym_from_name)(c.as_ptr(), xkb::xkb_keysym_flags::XKB_KEYSYM_NO_FLAGS) };
+        if sym != 0 {
+            return sym;
+        }
+        return unsafe {
+            (x.xkb_keysym_from_name)(c.as_ptr(), xkb::xkb_keysym_flags::XKB_KEYSYM_CASE_INSENSITIVE)
+        };
+    }
+    builtin_keysym(name)
+}
+
+/// Keysyms by name, for [`keysym_from_name`] without libxkbcommon.
+const KEYSYM_NAMES: [(&str, u32); 83] = [
+    ("BackSpace", 0xff08),
+    ("Tab", 0xff09),
+    ("ISO_Left_Tab", 0xfe20),
+    ("Return", 0xff0d),
+    ("Pause", 0xff13),
+    ("Scroll_Lock", 0xff14),
+    ("Escape", 0xff1b),
+    ("Delete", 0xffff),
+    ("Home", 0xff50),
+    ("Left", 0xff51),
+    ("Up", 0xff52),
+    ("Right", 0xff53),
+    ("Down", 0xff54),
+    ("Prior", 0xff55),
+    ("Page_Up", 0xff55),
+    ("Next", 0xff56),
+    ("Page_Down", 0xff56),
+    ("End", 0xff57),
+    ("Print", 0xff61),
+    ("Insert", 0xff63),
+    ("Menu", 0xff67),
+    ("Num_Lock", 0xff7f),
+    ("KP_Enter", 0xff8d),
+    ("KP_Home", 0xff95),
+    ("KP_Left", 0xff96),
+    ("KP_Up", 0xff97),
+    ("KP_Right", 0xff98),
+    ("KP_Down", 0xff99),
+    ("KP_Prior", 0xff9a),
+    ("KP_Page_Up", 0xff9a),
+    ("KP_Next", 0xff9b),
+    ("KP_Page_Down", 0xff9b),
+    ("KP_End", 0xff9c),
+    ("KP_Begin", 0xff9d),
+    ("KP_Insert", 0xff9e),
+    ("KP_Delete", 0xff9f),
+    ("KP_Multiply", 0xffaa),
+    ("KP_Add", 0xffab),
+    ("KP_Subtract", 0xffad),
+    ("KP_Decimal", 0xffae),
+    ("KP_Divide", 0xffaf),
+    ("Shift_L", 0xffe1),
+    ("Shift_R", 0xffe2),
+    ("Control_L", 0xffe3),
+    ("Control_R", 0xffe4),
+    ("Caps_Lock", 0xffe5),
+    ("Alt_L", 0xffe9),
+    ("Alt_R", 0xffea),
+    ("Super_L", 0xffeb),
+    ("Super_R", 0xffec),
+    ("space", 0x20),
+    ("exclam", 0x21),
+    ("quotedbl", 0x22),
+    ("numbersign", 0x23),
+    ("dollar", 0x24),
+    ("percent", 0x25),
+    ("ampersand", 0x26),
+    ("apostrophe", 0x27),
+    ("parenleft", 0x28),
+    ("parenright", 0x29),
+    ("asterisk", 0x2a),
+    ("plus", 0x2b),
+    ("comma", 0x2c),
+    ("minus", 0x2d),
+    ("period", 0x2e),
+    ("slash", 0x2f),
+    ("colon", 0x3a),
+    ("semicolon", 0x3b),
+    ("less", 0x3c),
+    ("equal", 0x3d),
+    ("greater", 0x3e),
+    ("question", 0x3f),
+    ("at", 0x40),
+    ("bracketleft", 0x5b),
+    ("backslash", 0x5c),
+    ("bracketright", 0x5d),
+    ("asciicircum", 0x5e),
+    ("underscore", 0x5f),
+    ("grave", 0x60),
+    ("braceleft", 0x7b),
+    ("bar", 0x7c),
+    ("braceright", 0x7d),
+    ("asciitilde", 0x7e),
+];
+
+fn builtin_keysym(name: &str) -> u32 {
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && c.is_ascii_alphanumeric()
+    {
+        return c as u32;
+    }
+    if let Some(&(_, sym)) = KEYSYM_NAMES.iter().find(|(n, _)| *n == name) {
         return sym;
     }
-    unsafe { (x.xkb_keysym_from_name)(c.as_ptr(), xkb::xkb_keysym_flags::XKB_KEYSYM_CASE_INSENSITIVE) }
+    if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<u32>().ok())
+        && (1..=35).contains(&n)
+    {
+        return 0xffbe + n - 1;
+    }
+    if let Some(c) = name
+        .strip_prefix('U')
+        .filter(|hex| hex.len() >= 2 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .and_then(char::from_u32)
+    {
+        return char_keysym(c);
+    }
+    KEYSYM_NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map_or(0, |&(_, sym)| sym)
+}
+
+/// The keysym of a character: Latin-1 ones are their code point, others
+/// `0x0100_0000` + it. For characters that have a legacy keysym, such as
+/// `€` or Cyrillic letters, xkb gives that one instead: `€` is 0x10020ac
+/// here but `EuroSign` (0x20ac) on Linux.
+pub(crate) fn char_keysym(c: char) -> u32 {
+    match c as u32 {
+        cp @ (0x20..=0x7e | 0xa0..=0xff) => cp,
+        cp => 0x0100_0000 + cp,
+    }
 }
 
 /// The lowercase keysym of a letter keysym (others unchanged).
@@ -308,7 +482,15 @@ pub fn keysym_to_lower(sym: u32) -> u32 {
 }
 
 /// Runs until [`Cx::exit`]: on Wayland, or on X11 where there is no
-/// Wayland (see the module docs).
+/// Wayland, or on Windows (see the module docs).
+#[cfg(windows)]
+pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
+    win32::run(make)
+}
+
+/// Runs until [`Cx::exit`]: on Wayland, or on X11 where there is no
+/// Wayland, or on Windows (see the module docs).
+#[cfg(unix)]
 pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     match std::env::var("QUI_BACKEND").as_deref() {
         Ok("wayland") => return run_wayland(make),
@@ -334,21 +516,21 @@ pub fn run<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     if cfg!(feature = "wayland") { run_wayland(make) } else { run_x11(make) }
 }
 
-#[cfg(feature = "wayland")]
+#[cfg(all(unix, feature = "wayland"))]
 fn run_wayland<A: App>(make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     let conn = Connection::connect_to_env().map_err(|e| format!("Cannot connect to Wayland: {e}"))?;
     wayland::run(conn, make)
 }
 
-#[cfg(not(feature = "wayland"))]
+#[cfg(all(unix, not(feature = "wayland")))]
 fn run_wayland<A: App>(_make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     Err("qui was built without Wayland support (the wayland feature)".into())
 }
 
-#[cfg(feature = "x11")]
+#[cfg(all(unix, feature = "x11"))]
 use x11::run as run_x11;
 
-#[cfg(not(feature = "x11"))]
+#[cfg(all(unix, not(feature = "x11")))]
 fn run_x11<A: App>(_make: impl FnOnce(Waker) -> A) -> Result<(), String> {
     Err("qui was built without X11 support (the x11 feature)".into())
 }
@@ -362,11 +544,18 @@ pub(crate) fn stat(msg: std::fmt::Arguments) {
     if !*ON.get_or_init(|| std::env::var_os("QUI_STATS").is_some() || std::env::var_os("RLS_STATS").is_some()) {
         return;
     }
+    eprintln!("qui: [{:.1}] {msg}", monotonic_ms());
+}
+
+#[cfg(unix)]
+fn monotonic_ms() -> f64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let ms = ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6;
-    eprintln!("qui: [{ms:.1}] {msg}");
+    ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6
 }
+
+#[cfg(windows)]
+use win32::monotonic_ms;
 
 /// What the backends share: the UI, the renderer and the last frame.
 pub(crate) struct Painter {
@@ -519,16 +708,21 @@ impl Painter {
             ui.images.clear();
         }
         // Return the driver's freed heap to the system.
-        unsafe { libc::malloc_trim(0) };
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0)
+        };
     }
 }
 
 /// A keymap and its state (owned: dropping unrefs them).
+#[cfg(unix)]
 pub(crate) struct Xkb {
     pub(crate) keymap: *mut xkb::xkb_keymap,
     pub(crate) state: *mut xkb::xkb_state,
 }
 
+#[cfg(unix)]
 impl Xkb {
     /// The event for a press of an XKB keycode (evdev + 8), and whether
     /// the key repeats.
@@ -588,6 +782,7 @@ impl Xkb {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Xkb {
     fn drop(&mut self) {
         if let Some(x) = xkb::xkbcommon_option() {
@@ -604,12 +799,13 @@ pub(crate) enum Fetched {
     Field(String),
     Pasted(Pasted),
     Dropped(Vec<PathBuf>),
-    /// Only Wayland reports failures to read.
-    #[cfg_attr(not(feature = "wayland"), allow(dead_code))]
+    /// Only Wayland and Windows report failures to read.
+    #[cfg_attr(not(any(windows, feature = "wayland")), allow(dead_code))]
     Error(String),
 }
 
 /// Which forms of the clipboard's content to read for a paste.
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 pub(crate) struct PastePlan {
     files: bool,
@@ -618,6 +814,7 @@ pub(crate) struct PastePlan {
     text: Option<&'static str>,
 }
 
+#[cfg(unix)]
 impl PastePlan {
     pub(crate) fn new(mimes: &[String]) -> PastePlan {
         PastePlan {
@@ -651,6 +848,7 @@ impl PastePlan {
 }
 
 /// The URIs of a `text/uri-list`.
+#[cfg(unix)]
 pub(crate) fn uri_list(data: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(data)
         .lines()
@@ -660,10 +858,28 @@ pub(crate) fn uri_list(data: &[u8]) -> Vec<String> {
 }
 
 /// The best plain-text MIME type offered.
+#[cfg(unix)]
 pub(crate) fn text_mime(mimes: &[String]) -> Option<&'static str> {
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"]
         .into_iter()
         .find(|m| mimes.iter().any(|x| x == m))
+}
+
+#[cfg(any(windows, all(unix, feature = "x11")))]
+/// Where a layer spec's window goes on a monitor (x, y, width, height),
+/// all in physical pixels (X11 and Windows, which have no layer shell): as the layer surface would be, the content
+/// centered in its area.
+pub(crate) fn place(spec: &Spec, scale: f32, (w, h): (u32, u32), (mx, my, mw, mh): (i32, i32, i32, i32)) -> (i32, i32) {
+    let s = |v: i32| (v as f32 * scale).round() as i32;
+    let [top, right, bottom, left] = spec.anchor;
+    let [mt, mr, mb, ml] = spec.margin;
+    let axis = |start: i32, len: i32, size: i32, near: bool, far: bool, m_near: i32, m_far: i32| match (near, far) {
+        (true, true) => start + s(m_near) + (len - s(m_near) - s(m_far) - size) / 2,
+        (true, false) => start + s(m_near),
+        (false, true) => start + len - s(m_far) - size,
+        (false, false) => start + (len - size) / 2,
+    };
+    (axis(mx, mw, w as i32, left, right, ml, mr), axis(my, mh, h as i32, top, bottom, mt, mb))
 }
 
 /// The named key for a keysym.
@@ -699,5 +915,45 @@ mod tests {
         assert_eq!(keysym_to_lower(0x61), 0x61);
         assert_eq!(keysym_to_lower(0xff0d), 0xff0d);
         assert_eq!(keysym_to_lower(0x0100_0000 + 'Ж' as u32), 0x0100_0000 + 'ж' as u32);
+    }
+
+    #[test]
+    fn builtin_keysyms() {
+        assert_eq!(builtin_keysym("Return"), 0xff0d);
+        assert_eq!(builtin_keysym("page_down"), 0xff56);
+        assert_eq!(builtin_keysym("a"), 0x61);
+        assert_eq!(builtin_keysym("A"), 0x41);
+        assert_eq!(builtin_keysym("F12"), 0xffc9);
+        assert_eq!(builtin_keysym("U20AC"), 0x0100_20ac);
+        assert_eq!(builtin_keysym("U0416"), 0x0100_0000 + 'Ж' as u32);
+        assert_eq!(builtin_keysym("NoSuchKey"), 0);
+        // The same as libxkbcommon's, where it is installed.
+        #[cfg(unix)]
+        if xkb::xkbcommon_option().is_some() {
+            for (name, sym) in KEYSYM_NAMES {
+                assert_eq!(keysym_from_name(name), sym, "{name}");
+            }
+            for name in ["F1", "F35", "U20AC", "U00E9", "e", "7", "é", "ж", "kp_enter", "F36", "Ux"] {
+                assert_eq!(keysym_from_name(name), builtin_keysym(name), "{name}");
+            }
+        }
+    }
+
+    #[cfg(any(windows, all(unix, feature = "x11")))]
+    #[test]
+    fn layer_placement() {
+        let monitor = (1920, 0, 1000, 800);
+        // Anchored everywhere: centered.
+        let spec = Spec { width: 200, height: 100, ..Spec::default() };
+        assert_eq!(place(&spec, 1.0, (200, 100), monitor), (1920 + 400, 350));
+        // Top and left, with margins, at scale 2.
+        let spec = Spec { anchor: [true, false, false, true], margin: [10, 0, 0, 5], ..spec };
+        assert_eq!(place(&spec, 2.0, (400, 200), monitor), (1920 + 10, 20));
+        // Bottom only: at the bottom, centered across.
+        let spec = Spec { anchor: [false, false, true, false], margin: [0, 0, 8, 0], ..spec };
+        assert_eq!(place(&spec, 1.0, (200, 100), monitor), (1920 + 400, 800 - 8 - 100));
+        // Top and bottom with uneven margins: centered in what's left.
+        let spec = Spec { anchor: [true, false, true, false], margin: [100, 0, 0, 0], ..spec };
+        assert_eq!(place(&spec, 1.0, (200, 100), monitor).1, 100 + (700 - 100) / 2);
     }
 }

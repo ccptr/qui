@@ -1427,6 +1427,8 @@ pub enum Native {
     Wayland { display: *mut std::ffi::c_void, surface: *mut std::ffi::c_void },
     /// An `xcb_connection_t*` and an X11 window.
     Xcb { connection: *mut std::ffi::c_void, window: u32 },
+    /// A Win32 `HINSTANCE` and `HWND`.
+    Win32 { hinstance: *mut std::ffi::c_void, hwnd: *mut std::ffi::c_void },
 }
 
 impl Native {
@@ -1438,6 +1440,7 @@ impl Native {
             Native::Xcb { connection, window } if connection.is_null() || window == 0 => {
                 Err("null X11 handle".into())
             }
+            Native::Win32 { hwnd, .. } if hwnd.is_null() => Err("null Win32 handle".into()),
             _ => Ok(()),
         }
     }
@@ -1447,6 +1450,7 @@ impl Native {
         match self {
             Native::Wayland { .. } => ash::khr::wayland_surface::NAME,
             Native::Xcb { .. } => ash::khr::xcb_surface::NAME,
+            Native::Win32 { .. } => ash::khr::win32_surface::NAME,
         }
     }
 }
@@ -1468,5 +1472,12 @@ unsafe fn create_surface(entry: &ash::Entry, instance: &ash::Instance, native: N
             )
         }
         .map_err(err("vkCreateXcbSurfaceKHR")),
+        Native::Win32 { hinstance, hwnd } => unsafe {
+            ash::khr::win32_surface::Instance::new(entry, instance).create_win32_surface(
+                &vk::Win32SurfaceCreateInfoKHR::default().hinstance(hinstance as isize).hwnd(hwnd as isize),
+                None,
+            )
+        }
+        .map_err(err("vkCreateWin32SurfaceKHR")),
     }
 }

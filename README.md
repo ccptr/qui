@@ -1,8 +1,8 @@
 # qui
 
 A small immediate-mode GUI toolkit on ash (Vulkan) and its own Wayland client
-(windows and layer-shell overlays), or X11 where there is no Wayland, with its own
-TrueType rasterizer. It is
+(windows and layer-shell overlays), or X11 where there is no Wayland, or Win32 on
+Windows, with its own TrueType rasterizer. It is
 event-driven: the UI is rebuilt after each input or app event, and a frame is only
 rendered when the quads changed.
 
@@ -14,8 +14,8 @@ rendered when the quads changed.
   sub-pixel offsets. CFF/OTF fonts aren't supported; they are skipped.
 * `text.rs`: a glyph cache on a 1024² R8 atlas (shelf packing), plus measuring,
   eliding and wrapping. Characters the first fonts lack fall back through
-  fontconfig's list (`fc-match -s`), opened only when needed; emoji prefer the
-  colour emoji font.
+  fontconfig's list (`fc-match -s`; on Windows, the system fonts for other
+  scripts), opened only when needed; emoji prefer the colour emoji font.
 * `image.rs`: a 1024² RGBA atlas for images and colour emoji, repacked when full,
   with CPU copies trimmed to a budget.
 * `gfx.rs`: Vulkan through `ash`. There's one pipeline: instanced quads, each an SDF
@@ -57,6 +57,19 @@ rendered when the quads changed.
   unmaps it and keeps its swapchain. The clipboard (with INCR for large data),
   XDND file drops and themed cursors work; exclusive zones, blur and input
   methods don't.
+* `window/win32.rs`: the same apps on Windows 10 (1703) or later, through Win32
+  (`windows-sys`) and `VK_KHR_win32_surface`; the `wayland` and `x11` features
+  do nothing there. The window procedures record messages and the loop handles
+  them, as on X11; during Windows' modal loops (moving or resizing a window)
+  the procedures run the loop's step themselves, so the content follows a resize.
+  A layer-shell spec becomes a borderless popup, off the taskbar, placed by its
+  anchors and margins in the work area of the monitor under the pointer; with an
+  exclusive keyboard it takes the focus, and losing it is a click outside. It is
+  per-monitor DPI aware (the scale is the monitor's DPI / 96). Keys are
+  translated to XKB keysyms and evdev codes, so bindings match as on Linux; text
+  comes from `WM_CHAR` (the input method's too, through its default window). The
+  clipboard (text, files, PNG or bitmap images), file drops, cursors and a dark
+  title bar under a dark theme work; transparency, exclusive zones and blur don't.
 
 ## Building and testing
 
@@ -64,6 +77,7 @@ rendered when the quads changed.
 cargo test                                   # rasterizer: exact coverage of a square and a half-pixel edge, plus a real system font
 cargo run --example layer --features png     # demo as a layer-shell overlay (--window: a normal window)
 shaders/build.sh                             # only after editing a shader: regenerates the committed SPIR-V
+cargo build --target x86_64-pc-windows-gnu --example layer --features png   # Windows, cross-built with mingw-w64
 ```
 
 `QUI_STATS=1` prints the GPU name and the time of every presented frame;
